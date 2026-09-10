@@ -202,3 +202,6 @@ docs/book/*
 !/raylib-5.5_webassembly/**
 !/inih-r62/
 !/inih-r62/**
+
+# Keep original PufferLib benchmark result
+!tests/pool/envpool_results.npy
