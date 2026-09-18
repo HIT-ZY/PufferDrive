@@ -1,4 +1,4 @@
-# PufferDrive_my
+# PufferDrive
 
 [![Unit Tests](https://github.com/Emerge-Lab/PufferDrive/actions/workflows/utest.yml/badge.svg)](https://github.com/Emerge-Lab/PufferDrive/actions/workflows/utest.yml)
 
