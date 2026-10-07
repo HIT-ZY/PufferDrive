@@ -717,7 +717,7 @@ def test_performance(timeout=10, atn_cache=1024, num_agents=1024):
 if __name__ == "__main__":
     # test_performance()
     # Process the train dataset
-    process_all_maps(data_folder="/mnt/workspace/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/training")
+    process_all_maps(data_folder="/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/training")
     # Process the validation/test dataset
     # process_all_maps(data_folder="data/processed/validation")
     # # Process the validation_interactive dataset
