@@ -4,7 +4,29 @@ Driving is a safety-critical multi-agent application, making careful evaluation 
 
 ## Evaluate all 150 test scenes
 
-Run the standalone evaluator from the repository root:
+Run these commands from the repository root. First convert the raw test JSON
+scenes and verify the resource link (once, before evaluation):
+
+```bash
+python pufferlib/ocean/drive/drive.py \
+  --data-folder /mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/testing \
+  --output-dir /mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/resources/drive/binaries/testing \
+  --workers 8
+readlink -f resources/drive/binaries/testing
+```
+
+The existing converter reads JSON scenes from
+`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/testing` and writes
+`map_000.bin` through `map_149.bin` to
+`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/resources/drive/binaries/testing`.
+The expected test split contains 150 JSON scenes. The existing training resource
+symlink makes `resources/drive/binaries/testing` resolve to the binary directory
+above; verify this with the `readlink` command. Conversion does not change links.
+Missing input or failed conversions raise an error. The evaluator verifies that
+all 150 numbered binaries are present. Running the converter without arguments
+keeps the original training conversion defaults.
+
+Then run the standalone evaluator:
 
 ```bash
 python setup.py build_ext --inplace --force
@@ -12,8 +34,8 @@ python scripts/evaluate_test.py \
   --checkpoint /path/to/model.pt
 ```
 
-The default test directory is
-`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/testing`, and the default
+The default test directory is `resources/drive/binaries/testing`, which resolves
+through the resource link to the binary directory above. The default
 output directory is `/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results`.
 Override them with `--test-dir` and `--output-dir` when needed.
 The default device is `cuda:0`; override it with `--device` when needed.

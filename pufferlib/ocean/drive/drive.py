@@ -657,6 +657,7 @@ def process_all_maps(
     data_folder="data/processed/training",
     max_maps=50_000,
     num_workers=None,
+    output_dir=None,
 ):
     """Process all maps and save them as binaries using multiprocessing
 
@@ -664,6 +665,7 @@ def process_all_maps(
         data_folder: Path to the folder containing JSON map files
         max_maps: Maximum number of maps to process
         num_workers: Number of parallel workers (defaults to cpu_count())
+        output_dir: Destination for binaries; defaults to resources/drive/binaries/<dataset>.
     """
     from pathlib import Path
 
@@ -673,13 +675,15 @@ def process_all_maps(
     # Path to the training data
     data_dir = Path(data_folder)
     dataset_name = data_dir.name
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Missing JSON directory: {data_dir}")
+    json_files = sorted(data_dir.glob("*.json"))
+    if not json_files:
+        raise ValueError(f"No JSON map files found in {data_dir}")
 
     # Create the binaries directory if it doesn't exist
-    binary_dir = Path(f"resources/drive/binaries/{dataset_name}")
+    binary_dir = Path(output_dir) if output_dir is not None else Path(f"resources/drive/binaries/{dataset_name}")
     binary_dir.mkdir(parents=True, exist_ok=True)
-
-    # Get all JSON files in the training directory
-    json_files = sorted(data_dir.glob("*.json"))
 
     # Prepare arguments for parallel processing
     tasks = []
@@ -703,6 +707,10 @@ def process_all_maps(
         for i, name, success, error in results:
             if not success:
                 print(f"  {name}: {error}")
+        raise RuntimeError(f"Map conversion failed for {failed}/{len(results)} files")
+
+    print(f"Converted {successful} maps to {binary_dir.resolve()}")
+    return binary_dir
 
 
 def test_performance(timeout=10, atn_cache=1024, num_agents=1024):
@@ -736,10 +744,17 @@ def test_performance(timeout=10, atn_cache=1024, num_agents=1024):
 
 
 if __name__ == "__main__":
-    # test_performance()
-    # Process the train dataset
-    process_all_maps(data_folder="/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/training")
-    # Process the validation/test dataset
-    # process_all_maps(data_folder="data/processed/validation")
-    # # Process the validation_interactive dataset
-    # process_all_maps(data_folder="data/processed/validation_interactive")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Convert driving scene JSON files to map binaries.")
+    parser.add_argument("--data-folder", default="/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/training",
+                        help="Input directory containing JSON scenes")
+    parser.add_argument("--output-dir", default=None,
+                        help="Output directory (default: resources/drive/binaries/<input directory name>)")
+    parser.add_argument("--max-maps", type=int, default=50_000)
+    parser.add_argument("--workers", type=int, default=None)
+    args = parser.parse_args()
+    if args.max_maps < 1 or (args.workers is not None and args.workers < 1):
+        parser.error("--max-maps and --workers must be positive")
+    process_all_maps(data_folder=args.data_folder, output_dir=args.output_dir,
+                     max_maps=args.max_maps, num_workers=args.workers)

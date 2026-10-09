@@ -16,7 +16,7 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TEST_DIR = Path("/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/testing")
+DEFAULT_TEST_DIR = Path("resources/drive/binaries/testing")
 DEFAULT_OUTPUT_DIR = Path("/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results")
 DRIVING_METRICS = (
     "safe_completion_rate", "completion_rate", "collision_rate",
@@ -80,6 +80,9 @@ def load_settings(path):
 
 def validate_maps(directory, num_maps):
     """Check all files and scenario identities before allocating simulator resources."""
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Missing binary test directory: {directory}. "
+                                "Convert test JSON files with pufferlib/ocean/drive/drive.py first.")
     paths = [directory / f"map_{i:03d}.bin" for i in range(num_maps)]
     actual = set(directory.glob("map_*.bin"))
     if actual != set(paths):

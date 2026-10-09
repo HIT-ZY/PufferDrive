@@ -26,8 +26,8 @@ def driving_row(n=1, success=1, goals=1, reached=1):
 
 class EvaluationTests(unittest.TestCase):
     def test_default_dataset_and_rollouts(self):
-        options = evaluation.parse_args(["--checkpoint", "model.pt", "--test-dir", "test",
-                                         "--output-dir", "results"])
+        options = evaluation.parse_args(["--checkpoint", "model.pt"])
+        self.assertEqual(options.test_dir, Path("resources/drive/binaries/testing"))
         self.assertEqual(options.num_maps, 150)
         self.assertEqual(options.wosac_rollouts, 32)
 
