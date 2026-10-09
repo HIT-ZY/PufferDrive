@@ -673,6 +673,9 @@ static PyObject *env_log(PyObject *self, PyObject *args) {
         ((float *)&aggregate)[i] /= n;
     }
     aggregate.n = (float)env->active_agent_count;
+    if (aggregate.goals_sampled_this_episode > 0.0f) {
+        aggregate.completion_rate = aggregate.goals_reached_this_episode / aggregate.goals_sampled_this_episode;
+    }
 
     my_log(dict, &aggregate);
 

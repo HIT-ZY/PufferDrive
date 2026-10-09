@@ -1066,6 +1066,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         args["env"]["init_mode"] = args["eval"]["wosac_init_mode"]
         args["env"]["control_mode"] = args["eval"]["wosac_control_mode"]
         args["env"]["init_steps"] = args["eval"]["wosac_init_steps"]
+        args["env"]["defer_reset"] = True
         args["env"]["goal_behavior"] = args["eval"]["wosac_goal_behavior"]
         args["env"]["goal_radius"] = args["eval"]["wosac_goal_radius"]
 

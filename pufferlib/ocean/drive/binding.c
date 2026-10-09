@@ -78,24 +78,42 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
     float goal_target_distance = unpack(kwargs, "goal_target_distance");
     int max_controlled_agents = unpack(kwargs, "max_controlled_agents");
 
+    // Explicit evaluation batches contain complete scenes, each loaded once.
+    PyObject *selected_maps = PyDict_GetItemString(kwargs, "map_ids");
+    if (selected_maps) {
+        if (!PyList_Check(selected_maps) || PyList_Size(selected_maps) == 0) {
+            PyErr_SetString(PyExc_ValueError, "map_ids must be a nonempty list");
+            return NULL;
+        }
+        for (Py_ssize_t i = 0; i < PyList_Size(selected_maps); i++) {
+            long map_id = PyLong_AsLong(PyList_GetItem(selected_maps, i));
+            if (PyErr_Occurred())
+                return NULL;
+            if (map_id < 0 || map_id >= num_maps) {
+                PyErr_SetString(PyExc_ValueError, "map_ids must be within [0, num_maps)");
+                return NULL;
+            }
+        }
+    }
+
     clock_gettime(CLOCK_REALTIME, &ts);
     srand(ts.tv_nsec); // Always use random sampling with replacement
 
     int total_agent_count = 0;
     int env_count = 0;
 
-    int max_envs = num_agents;
+    int max_envs = selected_maps ? (int)PyList_Size(selected_maps) : num_agents;
 
     int maps_checked = 0;
     PyObject *agent_offsets = PyList_New(max_envs + 1);
     PyObject *map_ids = PyList_New(max_envs);
 
     // Getting env count
-    while (total_agent_count < num_agents && env_count < max_envs) {
+    while (env_count < max_envs && (selected_maps || total_agent_count < num_agents)) {
         char map_file[512];
 
-        // Always sample randomly with replacement
-        int map_id = rand() % num_maps;
+        // Training samples with replacement; explicit evaluation preserves the requested order.
+        int map_id = selected_maps ? (int)PyLong_AsLong(PyList_GetItem(selected_maps, env_count)) : rand() % num_maps;
 
         // printf("Sampling map_id: %d\n", map_id);
 
@@ -108,6 +126,13 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
         env->max_controlled_agents = max_controlled_agents;
         snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
         env->entities = load_map_binary(map_file, env);
+        if (!env->entities) {
+            free(env);
+            Py_DECREF(agent_offsets);
+            Py_DECREF(map_ids);
+            PyErr_Format(PyExc_ValueError, "Could not load map %s", map_file);
+            return NULL;
+        }
         // Count the number of controllable agents in map
         set_active_agents(env);
 
@@ -116,7 +141,7 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
             maps_checked++;
 
             // Safeguard: if we've checked all available maps and found no active agents, raise an error
-            if (maps_checked >= num_maps) {
+            if (selected_maps || maps_checked >= num_maps) {
                 for (int j = 0; j < env->num_entities; j++) {
                     free_entity(&env->entities[j]);
                 }
@@ -129,7 +154,12 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
                 Py_DECREF(agent_offsets);
                 Py_DECREF(map_ids);
                 char error_msg[256];
-                sprintf(error_msg, "No controllable agents found in any of the %d available maps", num_maps);
+                if (selected_maps) {
+                    snprintf(error_msg, sizeof(error_msg), "No controllable agents found in selected map %d", map_id);
+                } else {
+                    snprintf(error_msg, sizeof(error_msg), "No controllable agents found in any of the %d available maps",
+                             num_maps);
+                }
                 PyErr_SetString(PyExc_ValueError, error_msg);
                 return NULL;
             }
@@ -165,7 +195,7 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
         free(env);
     }
 
-    if (total_agent_count >= num_agents) {
+    if (!selected_maps && total_agent_count >= num_agents) {
         total_agent_count = num_agents;
     }
 
@@ -176,6 +206,8 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
     // resize lists
     PyObject *resized_agent_offsets = PyList_GetSlice(agent_offsets, 0, env_count + 1);
     PyObject *resized_map_ids = PyList_GetSlice(map_ids, 0, env_count);
+    Py_DECREF(agent_offsets);
+    Py_DECREF(map_ids);
     PyObject *tuple = PyTuple_New(3);
     PyTuple_SetItem(tuple, 0, resized_agent_offsets);
     PyTuple_SetItem(tuple, 1, resized_map_ids);
@@ -238,6 +270,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->reward_goal_post_respawn = conf.reward_goal_post_respawn;
     env->episode_length = conf.episode_length;
     env->termination_mode = conf.termination_mode;
+    env->defer_reset = PyDict_GetItemString(kwargs, "defer_reset") ? (int)unpack(kwargs, "defer_reset") : 0;
     env->collision_behavior = conf.collision_behavior;
     env->offroad_behavior = conf.offroad_behavior;
     env->max_controlled_agents = unpack(kwargs, "max_controlled_agents");
@@ -272,6 +305,7 @@ static int my_log(PyObject *dict, Log *log) {
     assign_to_dict(dict, "episode_return", log->episode_return);
     assign_to_dict(dict, "dnf_rate", log->dnf_rate);
     assign_to_dict(dict, "completion_rate", log->completion_rate);
+    assign_to_dict(dict, "safe_completion_rate", log->safe_completion_rate);
     assign_to_dict(dict, "lane_alignment_rate", log->lane_alignment_rate);
     assign_to_dict(dict, "perc_controlled", log->perc_controlled);
     assign_to_dict(dict, "perc_other", log->perc_other);

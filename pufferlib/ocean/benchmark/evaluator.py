@@ -173,6 +173,8 @@ class WOSACEvaluator:
         """
 
         driver = puffer_env.driver_env
+        if not driver.defer_reset:
+            raise ValueError("WOSAC trajectory collection requires defer_reset=True to retain the final frame")
         num_agents = puffer_env.observation_space.shape[0]
         device = args["train"]["device"]
 
@@ -203,6 +205,9 @@ class WOSACEvaluator:
                 trajectories["heading"][:, rollout_idx, time_idx] = agent_state["heading"]
                 trajectories["id"][:, rollout_idx, time_idx] = agent_state["id"]
 
+                if time_idx == self.sim_steps - 1:
+                    break  # The final frame needs no further policy action.
+
                 # Step policy
                 with torch.no_grad():
                     ob_tensor = torch.as_tensor(obs).to(device)
@@ -213,7 +218,9 @@ class WOSACEvaluator:
                 if isinstance(logits, torch.distributions.Normal):
                     action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
 
-                obs, _, _, _, _ = puffer_env.step(action_np)
+                obs, _, _, truncations, _ = puffer_env.step(action_np)
+                if np.any(truncations) and time_idx < self.sim_steps - 2:
+                    raise RuntimeError("WOSAC episode ended before the final reference frame")
 
         return trajectories
 
@@ -271,6 +278,8 @@ class WOSACEvaluator:
         agent_state: Dict,
         road_edge_polylines: Dict,
         aggregate_results: bool = False,
+        drop_last_scenario: bool = True,
+        round_results: bool = True,
     ) -> Dict:
         """Compute realism metrics comparing simulated and ground truth trajectories.
 
@@ -279,6 +288,9 @@ class WOSACEvaluator:
             simulated_trajectories: Dict with keys ['x', 'y', 'z', 'heading', 'id']
             agent_state: Dict with length and width of agents.
             road_edge_polylines: Dict with keys ['x', 'y', 'lengths', 'scenario_id']
+            drop_last_scenario: Drop the potentially partial scene in random agent-budget batches.
+                Set False only when all selected scenes were loaded in full.
+            round_results: Round scene metrics for display; disable for dataset aggregation.
 
         Note: z-position currently not used.
 
@@ -597,7 +609,6 @@ class WOSACEvaluator:
 
         df_scene_level["realism_meta_score"] = df_scene_level.apply(self._compute_metametric, axis=1)
         df_scene_level["num_agents_per_scene"] = df.groupby("scenario_id").size()
-        df_scene_level = df_scene_level.round(3)
 
         # Get group summary metrics
         kinematic_metrics = np.mean(
@@ -606,7 +617,8 @@ class WOSACEvaluator:
                 df_scene_level["likelihood_linear_acceleration"],
                 df_scene_level["likelihood_angular_speed"],
                 df_scene_level["likelihood_angular_acceleration"],
-            ]
+            ],
+            axis=0,
         )
 
         interactive_metrics = np.mean(
@@ -614,14 +626,16 @@ class WOSACEvaluator:
                 df_scene_level["likelihood_collision_indication"],
                 df_scene_level["likelihood_distance_to_nearest_object"],
                 df_scene_level["likelihood_time_to_collision"],
-            ]
+            ],
+            axis=0,
         )
 
         map_metrics = np.mean(
             [
                 df_scene_level["likelihood_distance_to_road_edge"],
                 df_scene_level["likelihood_offroad_indication"],
-            ]
+            ],
+            axis=0,
         )
 
         df_scene_level["kinematic_metrics"] = kinematic_metrics
@@ -629,8 +643,11 @@ class WOSACEvaluator:
         df_scene_level["map_based_metrics"] = map_metrics
 
         # Safety: drop the last scenario (potentially incomplete) from the scene-level results
-        if last_scenario_id in df_scene_level.index:
+        if drop_last_scenario and last_scenario_id in df_scene_level.index:
             df_scene_level = df_scene_level.drop(last_scenario_id)
+
+        if round_results:
+            df_scene_level = df_scene_level.round(3)
 
         if aggregate_results:
             # Aggregate over scenarios
@@ -935,11 +952,13 @@ class Evaluator:
         if self.human_replay_stats is not None:
             eval_stats["eval/hr_collision_rate"] = self.human_replay_stats["collision_rate"]
             eval_stats["eval/hr_score"] = self.human_replay_stats["score"]
+            eval_stats["eval/hr_safe_completion_rate"] = self.human_replay_stats["safe_completion_rate"]
         if self.self_play_stats is not None:
             eval_stats["eval/sp_collision_rate"] = self.self_play_stats["collision_rate"]
             eval_stats["eval/sp_score"] = self.self_play_stats["score"]
+            eval_stats["eval/sp_safe_completion_rate"] = self.self_play_stats["safe_completion_rate"]
             eval_stats["eval/num_agents"] = self.self_play_stats["n"]
-        else:
+        if not eval_stats:
             return
 
         self.logger.wandb.log(eval_stats)

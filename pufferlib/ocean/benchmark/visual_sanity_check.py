@@ -103,6 +103,8 @@ def main():
     config["env"]["init_mode"] = config["eval"]["wosac_init_mode"]
     config["env"]["control_mode"] = config["eval"]["wosac_control_mode"]
     config["env"]["init_steps"] = config["eval"]["wosac_init_steps"]
+    config["env"]["defer_reset"] = True
+    config["env"]["termination_mode"] = 0
     config["env"]["goal_behavior"] = config["eval"]["wosac_goal_behavior"]
 
     config["env"]["map_dir"] = config["eval"]["map_dir"]

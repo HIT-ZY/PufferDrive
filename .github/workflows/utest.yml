@@ -46,6 +46,14 @@ jobs:
       - name: Compile C extensions
         run: python setup.py build_ext --inplace --force
 
+      - name: Run driving metric tests
+        run: |
+          gcc -I. -Iraylib-5.5_linux_amd64/include -ffunction-sections -fdata-sections tests/drive/test_metrics.c -Wl,--gc-sections -lm -o /tmp/test_drive_metrics
+          /tmp/test_drive_metrics
+
+      - name: Run test-set evaluation tests
+        run: python -m unittest discover -s tests -p test_evaluate_test.py -v
+
       - name: Run C ini parsing tests
         run: |
           chmod +x tests/ini_parser/build_n_test.sh

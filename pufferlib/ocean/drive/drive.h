@@ -179,6 +179,7 @@ struct Log {
     float offroad_rate;
     float collision_rate;
     float completion_rate;
+    float safe_completion_rate;
     float offroad_per_agent;
     float collisions_per_agent;
     float dnf_rate;
@@ -333,6 +334,8 @@ struct Drive {
     GridMap *grid_map;
     int *neighbor_offsets;
     int episode_length;
+    int defer_reset; // Evaluation retains the final state until an explicit reset.
+    int episode_done;
     int termination_mode;
     float reward_vehicle_collision;
     float reward_offroad_collision;
@@ -377,6 +380,12 @@ void add_log(Drive *env) {
         env->log.collisions_per_agent += collisions_per_agent;
 
         float frac_goal_reached = e->goals_reached_this_episode / e->goals_sampled_this_episode;
+
+        // Strict episode-level success: all assigned goals completed and no safety violation,
+        // including violations before or after a respawn. Per-agent logs survive respawns.
+        if (e->goals_sampled_this_episode > 0.0f && frac_goal_reached >= 1.0f && !collided && !offroad) {
+            env->log.safe_completion_rate += 1.0f;
+        }
 
         // Update score, which is an aggregate measure whether the agent fully solved its task
         float threshold = 1.0f; // Default threshold for 1 goal (must complete it)
@@ -2029,6 +2038,7 @@ void sample_new_goal(Drive *env, int agent_idx) {
 }
 
 void c_reset(Drive *env) {
+    env->episode_done = 0;
     env->timestep = env->init_steps;
     set_start_position(env);
     for (int x = 0; x < env->active_agent_count; x++) {
@@ -2084,6 +2094,11 @@ void respawn_agent(Drive *env, int agent_idx) {
 
 void c_step(Drive *env) {
     memset(env->rewards, 0, env->active_agent_count * sizeof(float));
+    if (env->defer_reset && env->episode_done) {
+        memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
+        memset(env->truncations, 1, env->active_agent_count * sizeof(unsigned char));
+        return;
+    }
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
     env->timestep++;
@@ -2163,6 +2178,9 @@ void c_step(Drive *env) {
                 env->entities[agent_idx].current_goal_reached = 0;
                 env->entities[agent_idx].goals_reached_this_episode += 1.0f;
             } else { // Zero out the velocity so that the agent stops at the goal
+                if (env->goal_behavior == GOAL_STOP) {
+                    env->entities[agent_idx].current_goal_reached = 1;
+                }
                 env->rewards[i] = env->reward_goal;
                 env->logs[i].episode_return = env->reward_goal;
                 env->entities[agent_idx].stopped = 1;
@@ -2215,7 +2233,12 @@ void c_step(Drive *env) {
             env->truncations[i] = 1;
         }
         add_log(env);
-        c_reset(env);
+        if (env->defer_reset) {
+            env->episode_done = 1;
+            compute_observations(env);
+        } else {
+            c_reset(env);
+        }
         return;
     }
 

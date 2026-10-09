@@ -49,6 +49,8 @@ class Drive(pufferlib.PufferEnv):
         control_mode="control_vehicles",
         max_controlled_agents=32,
         map_dir="resources/drive/binaries/training",
+        map_ids=None,
+        defer_reset=False,
     ):
         # env
         self.dt = dt
@@ -68,6 +70,7 @@ class Drive(pufferlib.PufferEnv):
         self.human_agent_idx = human_agent_idx
         self.episode_length = episode_length
         self.termination_mode = termination_mode
+        self.defer_reset = defer_reset
         self.resample_frequency = resample_frequency
         self.dynamics_model = dynamics_model
         self.max_controlled_agents = max_controlled_agents
@@ -95,6 +98,17 @@ class Drive(pufferlib.PufferEnv):
         self.init_mode_str = init_mode
         self.control_mode_str = control_mode
         self.map_dir = map_dir
+        self.selected_map_ids = None if map_ids is None else list(map_ids)
+        if self.selected_map_ids is not None:
+            if not self.selected_map_ids or len(set(self.selected_map_ids)) != len(self.selected_map_ids):
+                raise ValueError("map_ids must be nonempty and contain no duplicates")
+            for map_id in self.selected_map_ids:
+                if not isinstance(map_id, int) or not 0 <= map_id < num_maps:
+                    raise ValueError("map_ids must contain integers within [0, num_maps)")
+                if not os.path.isfile(os.path.join(map_dir, f"map_{map_id:03d}.bin")):
+                    raise FileNotFoundError(f"Missing selected map: map_{map_id:03d}.bin")
+            if resample_frequency != 0:
+                raise ValueError("Explicit map_ids require resample_frequency=0")
 
         if self.control_mode_str == "control_vehicles":
             self.control_mode = 0
@@ -162,6 +176,7 @@ class Drive(pufferlib.PufferEnv):
             goal_behavior=self.goal_behavior,
             goal_target_distance=self.goal_target_distance,
             max_controlled_agents=self.max_controlled_agents,
+            **({"map_ids": self.selected_map_ids} if self.selected_map_ids is not None else {}),
         )
 
         self.num_agents = agent_offsets[-1]
@@ -195,9 +210,11 @@ class Drive(pufferlib.PufferEnv):
                 dt=dt,
                 episode_length=(int(episode_length) if episode_length is not None else None),
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
+                defer_reset=self.defer_reset,
                 map_id=map_ids[i],
                 max_agents=nxt - cur,
-                ini_file="pufferlib/config/ocean/drive.ini",
+                ini_file=os.path.join(os.path.dirname(__file__), "../../config/ocean/drive.ini"),
+                dynamics_model=0 if self.dynamics_model == "classic" else 1,
                 init_steps=init_steps,
                 init_mode=self.init_mode,
                 control_mode=self.control_mode,
@@ -217,6 +234,8 @@ class Drive(pufferlib.PufferEnv):
 
     def resample_maps(self):
         """Resample environment maps."""
+        if self.selected_map_ids is not None:
+            raise ValueError("Explicit map batches cannot be resampled; create a new Drive instance")
         self.tick = 0
         binding.vec_close(self.c_envs)
         agent_offsets, map_ids, num_envs = binding.shared(
@@ -262,12 +281,14 @@ class Drive(pufferlib.PufferEnv):
                 episode_length=(int(self.episode_length) if self.episode_length is not None else None),
                 map_id=map_ids[i],
                 max_agents=nxt - cur,
-                ini_file="pufferlib/config/ocean/drive.ini",
+                ini_file=os.path.join(os.path.dirname(__file__), "../../config/ocean/drive.ini"),
+                dynamics_model=0 if self.dynamics_model == "classic" else 1,
                 init_steps=self.init_steps,
                 init_mode=self.init_mode,
                 control_mode=self.control_mode,
                 map_dir=self.map_dir,
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
+                defer_reset=self.defer_reset,
                 max_controlled_agents=self.max_controlled_agents,
                 render_mode=self.render_mode,
             )
