@@ -4,105 +4,141 @@ Driving is a safety-critical multi-agent application, making careful evaluation 
 
 ## Evaluate all 150 test scenes
 
-Run these commands from the repository root. First convert the raw test JSON
-scenes and verify the resource link (once, before evaluation):
+Run the standalone evaluator from the repository root:
+
+```bash
+python scripts/evaluate_test.py \
+  --checkpoint /path/to/model.pt
+```
+
+The defaults are 150 maps, `cuda:0`, test directory
+`resources/drive/binaries/testing`, and output directory
+`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results`.
+The existing resource symlink should resolve the test directory to
+`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/resources/drive/binaries/testing`.
+Verify it with `readlink -f resources/drive/binaries/testing`.
+Override paths with `--test-dir` and `--output-dir`, or use `--device cpu`.
+
+By default, `--replay-ego custom` runs two passes in sequence:
+
+- `self_play`: the policy controls eligible agents, including the selected ego.
+- `custom_replay`: the policy controls exactly one selected vehicle per scene;
+  other created agents follow their logged trajectories.
+
+Both groups report `safe_completion_rate`, `completion_rate`, `collision_rate`,
+`offroad_rate`, `score`, and `dnf_rate`. WOSAC is explicitly skipped in custom
+mode because this mode discards the original track-index metadata.
+
+The ego is selected deterministically from vehicles valid at frame 0, with a
+finite initial state, positive width and length, and a goal farther away than
+`max(2 metres, goal_radius)`. Among eligible vehicles, selection prefers those
+not marked as expert, then takes the lowest index in the current object list.
+If all eligible vehicles are marked as expert, the first of those is selected.
+A scene without an eligible vehicle causes an error. Selection does not rotate
+through vehicles or change randomly between rollouts. With the default one
+rollout per scene, custom replay evaluates 150 ego episodes.
+
+Existing BIN files need no reconversion for custom replay, even if their original
+SDC or prediction indices are out of range. The evaluator creates temporary map
+copies, writes the selected ego index into the SDC slot, and clears prediction
+indices. Object IDs, trajectories, roads, and the source files remain unchanged.
+Both driving passes use these copies, and they are deleted after evaluation.
+The selected vehicle is a custom ego, not a recovered dataset SDC.
+
+### Converting raw JSON for custom replay
+
+If the BIN files do not exist yet, use the existing converter:
 
 ```bash
 python pufferlib/ocean/drive/drive.py \
   --data-folder /mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/testing \
   --output-dir /mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/resources/drive/binaries/testing \
+  --discard-track-metadata \
   --workers 8
-readlink -f resources/drive/binaries/testing
 ```
 
-The existing converter reads JSON scenes from
-`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/testing` and writes
-`map_000.bin` through `map_149.bin` to
-`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/resources/drive/binaries/testing`.
-The expected test split contains 150 JSON scenes. The existing training resource
-symlink makes `resources/drive/binaries/testing` resolve to the binary directory
-above; verify this with the `readlink` command. Conversion does not change links.
-Missing input or failed conversions raise an error. The evaluator verifies that
-all 150 numbered binaries are present. Running the converter without arguments
-keeps the original training conversion defaults.
+`--discard-track-metadata` writes an unset SDC index and no prediction indices;
+it is intended for custom replay when the original mapping is unavailable.
+It does not modify source JSON. Omit this flag to preserve correctly mapped
+metadata for the original SDC/WOSAC protocol. Conversion does not change resource
+links. Missing input or failed conversions raise an error. Running the converter
+without arguments keeps its original training defaults.
 
-Then run the standalone evaluator:
+The evaluator requires exactly `map_000.bin` through `map_149.bin`, with distinct
+scenario IDs and 91-frame reference trajectories. Use `--num-maps N` for a
+different dataset size. Raw JSON files cannot be used directly.
+
+### Original SDC and WOSAC protocol
+
+For data with verified original track mappings, enable all three passes:
 
 ```bash
-python setup.py build_ext --inplace --force
 python scripts/evaluate_test.py \
-  --checkpoint /path/to/model.pt
+  --checkpoint /path/to/model.pt \
+  --replay-ego sdc
 ```
 
-The default test directory is `resources/drive/binaries/testing`, which resolves
-through the resource link to the binary directory above. The default
-output directory is `/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results`.
-Override them with `--test-dir` and `--output-dir` when needed.
-The default device is `cuda:0`; override it with `--device` when needed.
+This runs `self_play`, `human_replay` (the dataset SDC only), and `wosac`, in that
+order. Human replay reports the same six driving metrics; WOSAC reports
+`realism_meta_score`, `ade`, `min_ade`, `kinematic_metrics`,
+`interactive_metrics`, and `map_based_metrics`.
 
-The test directory must contain exactly `map_000.bin` through `map_149.bin`,
-with distinct scenario IDs and valid SDC indices for human-replay.
-Use `--num-maps N` for a different dataset size.
-These must be converted map binaries containing reference trajectories and
-`tracks_to_predict` metadata for WOSAC, not raw JSON files or a challenge split
-whose future reference trajectories are unavailable.
+SDC and `tracks_to_predict` metadata must use positions in the current objects
+list, not object IDs or positions in an earlier, unfiltered track list. The
+converter rejects out-of-range indices unless metadata is explicitly discarded.
+If objects were filtered without updating metadata, recover the original
+track-index-to-object-ID mapping from the source scenario and remap both fields.
+An object with `id=35` is not necessarily the original track at index 35.
+Passing a bounds check alone cannot establish that the mapping is correct.
+WOSAC also requires future reference trajectories and valid prediction targets.
 
-The script loads each map once per evaluation pass, without random map sampling
-or partial scenes. All three passes (self-play, human-replay, and WOSAC) always
-run, independently of the INI's evaluation enable flags. By default it processes
-8 complete scenes per batch, runs one self-play episode and one human-replay
-episode per scene, and collects 32 WOSAC rollouts per scene. Use `--batch-size`,
-`--driving-rollouts`, and `--wosac-rollouts` to adjust those counts.
-`--driving-rollouts` applies separately to both driving passes.
-Use `--device cpu` without a GPU. If the checkpoint was trained with a different
-architecture, action space, or reward/goal configuration, supply its INI using
-`--config /path/to/drive.ini`; it is merged over `pufferlib/config/default.ini`.
+### Execution and saved results
 
-The terminal prints three separate groups of six metrics:
+The script covers maps in index order without random map sampling or partial
+scenes. Each pass creates and closes its own environments and uses independent
+settings. The INI's evaluation enable flags do not control this script.
+Defaults are 8 complete scenes per batch, one episode per scene in each driving
+pass, and 32 rollouts per scene when WOSAC is enabled. Use `--batch-size`,
+`--driving-rollouts`, and `--wosac-rollouts` to change those counts.
+If a checkpoint uses a different architecture, action space, or reward/goal
+configuration, supply its INI with `--config /path/to/drive.ini`; it is merged
+over `pufferlib/config/default.ini`.
 
-- `self_play`: `safe_completion_rate`, `completion_rate`, `collision_rate`,
-  `offroad_rate`, `score`, `dnf_rate`.
-- `human_replay`: `safe_completion_rate`, `completion_rate`, `collision_rate`,
-  `offroad_rate`, `score`, `dnf_rate`.
-- `wosac`: `realism_meta_score`, `ade`, `min_ade`, `kinematic_metrics`,
-  `interactive_metrics`, `map_based_metrics`.
+A uniquely named `test_metrics_<UTC timestamp>_<id>.json` contains metrics,
+checkpoint/config paths, effective settings, coverage, and per-scene results.
+The report uses `schema_version: 3`. In custom mode, `metrics`, `per_scene`, and
+`coverage` contain `self_play`, `custom_replay`, and `wosac` entries.
+`ego_selection` records each scene's selected object index and ID, expert flag,
+and original SDC index. For example, read custom replay success from
+`report["metrics"]["custom_replay"]["safe_completion_rate"]`.
+Skipped WOSAC metrics are `null`, its coverage is 0, and `skipped.wosac` explains
+why. With `--replay-ego sdc`, `human_replay` replaces `custom_replay` and all
+three groups run.
 
-A uniquely named `test_metrics_<UTC timestamp>_<id>.json` is saved in the output
-directory. It contains the metrics, checkpoint/config paths, effective evaluation
-settings, coverage, and per-scene results. The report uses `schema_version: 2`;
-`metrics`, `per_scene`, and `coverage` each contain `self_play`, `human_replay`,
-and `wosac` entries. For example, read the human-replay success rate from
-`report["metrics"]["human_replay"]["safe_completion_rate"]`.
 `agent_episodes` records separate counts for the two driving passes.
 Driving rates are weighted by agent episode counts within each pass; completion
 is computed from total completed/assigned goals. Results from the two driving
-modes are never pooled.
-WOSAC metrics are averaged equally across scenes, retaining full precision.
+modes are never pooled. Enabled WOSAC metrics are averaged equally across scenes,
+retaining full precision.
 
-Both driving modes start at step 0 for the 90 transitions of a 91-frame scene,
-with the configured driving rewards and goal behavior. Self-play controls all
-eligible agents. Human-replay controls only the fixed SDC identified by the
-dataset; other vehicles follow their logged trajectories. It does not rotate
-through vehicles or randomly choose an ego vehicle. At the defaults, human-replay
-therefore evaluates 150 SDC episodes, while self-play evaluates more agent
-episodes according to the number of eligible agents in each scene.
-WOSAC uses the separate
-`wosac_*` environment settings (by default step 10, `control_wosac`, and stop at
-the goal). All three passes follow the existing evaluator's LSTM reset behavior:
-reset at rollout start, with no per-agent reset on respawn. Their effective
-environment settings are recorded separately in the JSON.
+Both driving passes start at step 0 for the 90 transitions of a 91-frame scene,
+with the configured driving rewards and goal behavior. WOSAC uses the separate
+`wosac_*` settings (by default step 10, `control_wosac`, and stop at the goal).
+Each pass resets LSTM state at rollout start, with no per-agent reset on respawn,
+matching the existing evaluator.
 
 WOSAC retains the final simulation state until the next explicit reset
 (`defer_reset=True`). From frame 10, it records 81 states through frame 90 with
-80 policy steps, so an automatically reset start state cannot enter the trajectory.
-Driving passes use the default automatic reset and collect their episode logs
-at the boundary. In `goal_behavior=2` (stop), each assigned goal is counted as
-completed only once, even if the agent remains at the goal for many steps.
+80 policy steps. Driving passes use automatic reset and collect their episode
+logs at the boundary. In `goal_behavior=2` (stop), each assigned goal is counted
+as completed only once, even if the agent stays at the goal for many steps.
 
-Missing scenes, missing WOSAC results, or invalid metrics cause a nonzero exit
-and a report with `status: "failed"`; any partial results and coverage remain
-available. Only `status: "complete"` indicates that all three passes covered the
-entire requested dataset. No WandB account or rendering is required.
+Missing scenes, missing results from an enabled pass, or invalid metrics cause
+a nonzero exit and `status: "failed"`; partial results and coverage remain
+available. `status: "complete"` means all enabled passes covered the requested
+dataset: two in custom mode, three in SDC mode. No WandB account or rendering is
+required. Rebuild the C extension after native code updates with
+`python setup.py build_ext --inplace --force`.
 
 ## Safe goal completion
 

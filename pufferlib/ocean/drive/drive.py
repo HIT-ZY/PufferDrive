@@ -492,17 +492,29 @@ def simplify_polyline(geometry, polyline_reduction_threshold, max_segment_length
     return [geometry[i] for i in range(num_points) if not skip[i]]
 
 
-def save_map_binary(map_data, output_file, unique_map_id):
+def save_map_binary(map_data, output_file, unique_map_id, discard_track_metadata=False):
+    """Save a map with metadata referring to positions in its current objects list."""
     trajectory_length = 91
-    """Saves map data in a binary format readable by C"""
+    metadata = {} if discard_track_metadata else map_data.get("metadata", {})
+    sdc_track_index = metadata.get("sdc_track_index", -1)
+    tracks_to_predict = metadata.get("tracks_to_predict", [])
+    num_objects = len(map_data.get("objects", []))
+    scenario_id = map_data.get("scenario_id", f"map_{unique_map_id:03d}")
+    indices = [("sdc_track_index", sdc_track_index, True)]
+    indices.extend((f"tracks_to_predict[{i}].track_index", track.get("track_index", -1), False)
+                   for i, track in enumerate(tracks_to_predict))
+    invalid = [f"{name}={index}" for name, index, allow_missing in indices
+               if type(index) is not int or not (0 <= index < num_objects or (allow_missing and index == -1))]
+    if invalid:
+        raise ValueError(
+            f"Scene {scenario_id}: invalid object-list indices ({', '.join(invalid)}); "
+            f"num_objects={num_objects}. Metadata may refer to the original unfiltered tracks. "
+            "Recover the original track-index-to-object-ID mapping before conversion; "
+            "object IDs are not list indices. No binary was written."
+        )
+    # Validate before opening: a failed conversion must not truncate an existing binary.
     with open(output_file, "wb") as f:
-        # Get metadata
-        metadata = map_data.get("metadata", {})
-        sdc_track_index = metadata.get("sdc_track_index", -1)  # -1 as default if not found
-        tracks_to_predict = metadata.get("tracks_to_predict", [])
-
         # Write original scenario_id with fallback to placeholder
-        scenario_id = map_data.get("scenario_id", f"map_{unique_map_id:03d}")
         f.write(struct.pack("16s", scenario_id.encode("utf-8")))
 
         # Write sdc_track_index
@@ -515,7 +527,6 @@ def save_map_binary(map_data, output_file, unique_map_id):
             f.write(struct.pack("i", track_index))
 
         # Count total entities
-        num_objects = len(map_data.get("objects", []))
         num_roads = len(map_data.get("roads", []))
         # num_entities = num_objects + num_roads
         f.write(struct.pack("i", num_objects))
@@ -634,20 +645,20 @@ def save_map_binary(map_data, output_file, unique_map_id):
             f.write(struct.pack("i", road.get("mark_as_expert", 0)))
 
 
-def load_map(map_name, unique_map_id, binary_output=None):
+def load_map(map_name, unique_map_id, binary_output=None, discard_track_metadata=False):
     """Loads a JSON map and optionally saves it as binary"""
     with open(map_name, "r") as f:
         map_data = json.load(f)
 
     if binary_output:
-        save_map_binary(map_data, binary_output, unique_map_id)
+        save_map_binary(map_data, binary_output, unique_map_id, discard_track_metadata=discard_track_metadata)
 
 
 def _process_single_map(args):
     """Worker function to process a single map file"""
-    i, map_path, binary_path = args
+    i, map_path, binary_path, *options = args
     try:
-        load_map(str(map_path), i, str(binary_path))
+        load_map(str(map_path), i, str(binary_path), discard_track_metadata=options[0] if options else False)
         return (i, map_path.name, True, None)
     except Exception as e:
         return (i, map_path.name, False, str(e))
@@ -658,6 +669,7 @@ def process_all_maps(
     max_maps=50_000,
     num_workers=None,
     output_dir=None,
+    discard_track_metadata=False,
 ):
     """Process all maps and save them as binaries using multiprocessing
 
@@ -666,6 +678,7 @@ def process_all_maps(
         max_maps: Maximum number of maps to process
         num_workers: Number of parallel workers (defaults to cpu_count())
         output_dir: Destination for binaries; defaults to resources/drive/binaries/<dataset>.
+        discard_track_metadata: Explicit custom evaluation mode; write no original SDC/WOSAC indices.
     """
     from pathlib import Path
 
@@ -690,7 +703,7 @@ def process_all_maps(
     for i, map_path in enumerate(json_files[:max_maps]):
         binary_file = f"map_{i:03d}.bin"
         binary_path = binary_dir / binary_file
-        tasks.append((i, map_path, binary_path))
+        tasks.append((i, map_path, binary_path, discard_track_metadata))
 
     # Process maps in parallel with progress bar
     with Pool(num_workers) as pool:
@@ -753,8 +766,11 @@ if __name__ == "__main__":
                         help="Output directory (default: resources/drive/binaries/<input directory name>)")
     parser.add_argument("--max-maps", type=int, default=50_000)
     parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--discard-track-metadata", action="store_true",
+                        help="For custom replay only: discard original SDC and tracks_to_predict indices")
     args = parser.parse_args()
     if args.max_maps < 1 or (args.workers is not None and args.workers < 1):
         parser.error("--max-maps and --workers must be positive")
     process_all_maps(data_folder=args.data_folder, output_dir=args.output_dir,
-                     max_maps=args.max_maps, num_workers=args.workers)
+                     max_maps=args.max_maps, num_workers=args.workers,
+                     discard_track_metadata=args.discard_track_metadata)

@@ -12,6 +12,7 @@ from pathlib import Path
 import random
 import struct
 import sys
+import tempfile
 import uuid
 
 
@@ -27,6 +28,12 @@ WOSAC_METRICS = (
     "kinematic_metrics", "interactive_metrics", "map_based_metrics",
 )
 METRIC_GROUPS = {"self_play": DRIVING_METRICS, "human_replay": DRIVING_METRICS, "wosac": WOSAC_METRICS}
+
+
+def metric_groups(options):
+    if getattr(options, "replay_ego", "sdc") == "custom":
+        return {"self_play": DRIVING_METRICS, "custom_replay": DRIVING_METRICS, "wosac": WOSAC_METRICS}
+    return METRIC_GROUPS
 
 
 def positive_int(value):
@@ -46,10 +53,12 @@ def parse_args(argv=None):
     parser.add_argument("--num-maps", type=positive_int, default=150)
     parser.add_argument("--batch-size", type=positive_int, default=8, help="Complete scenes per batch")
     parser.add_argument("--driving-rollouts", type=positive_int, default=1,
-                        help="Rollouts per scene for each of self-play and human-replay (default: 1)")
+                        help="Rollouts per scene for each driving pass (default: 1)")
     parser.add_argument("--wosac-rollouts", type=positive_int, default=32)
     parser.add_argument("--device", default="cuda:0", help="Device, e.g. cuda:0 or cpu (default: %(default)s)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--replay-ego", choices=("custom", "sdc"), default="custom",
+                        help="custom: select a valid vehicle and skip WOSAC; sdc: require original metadata and run WOSAC")
     parser.add_argument("--config", type=Path, default=ROOT / "pufferlib/config/ocean/drive.ini",
                         help="Training INI (architecture and driving reward/goal settings)")
     return parser.parse_args(argv)
@@ -78,7 +87,7 @@ def load_settings(path):
     return config
 
 
-def validate_maps(directory, num_maps):
+def validate_maps(directory, num_maps, check_indices=True):
     """Check all files and scenario identities before allocating simulator resources."""
     if not directory.is_dir():
         raise FileNotFoundError(f"Missing binary test directory: {directory}. "
@@ -101,13 +110,67 @@ def validate_maps(directory, num_maps):
         scenario_id = header.rstrip(b"\0").decode("utf-8")
         if not scenario_id or scenario_id in scenario_ids:
             raise ValueError(f"Empty or duplicate scenario ID in {path}: {scenario_id!r}")
-        validate_sdc(path)
+        if check_indices:
+            validate_sdc(path)
         scenario_ids.append(scenario_id)
     return scenario_ids
 
 
+def prepare_custom_maps(directory, destination, num_maps, goal_radius):
+    """Make temporary map copies with a deterministic ego and no original WOSAC indices."""
+    ids = validate_maps(directory, num_maps, check_indices=False)
+    destination.mkdir(parents=True, exist_ok=True)
+    selections = []
+    for map_id, scenario_id in enumerate(ids):
+        path = directory / f"map_{map_id:03d}.bin"
+        data = path.read_bytes()
+        if len(data) < 32:
+            raise ValueError(f"Truncated map header: {path}")
+        original_sdc, num_tracks = struct.unpack_from("2i", data, 16)
+        counts_offset = 24 + 4 * num_tracks
+        if num_tracks < 0 or counts_offset + 8 > len(data):
+            raise ValueError(f"Invalid track metadata length: {path}")
+        num_objects, num_roads = struct.unpack_from("2i", data, counts_offset)
+        if num_objects < 1 or num_roads < 0:
+            raise ValueError(f"Invalid object counts: {path}")
+        offset = counts_offset + 8
+        candidates = []
+        for index in range(num_objects):
+            if offset + 16 > len(data):
+                raise ValueError(f"Truncated object {index}: {path}")
+            _, kind, object_id, frames = struct.unpack_from("4i", data, offset)
+            # Drive's fixed evaluation horizon requires 91 frames per dynamic object.
+            if kind not in (1, 2, 3) or frames != 91:
+                raise ValueError(f"Unsupported object type/trajectory length at object {index}: {path}")
+            arrays = offset + 16
+            scalars = arrays + 8 * frames * 4
+            if scalars + 28 > len(data):
+                raise ValueError(f"Truncated trajectory for object {index}: {path}")
+            width, length, height, goal_x, goal_y, goal_z, expert = struct.unpack_from("6fi", data, scalars)
+            x, y, z, vx, vy, vz, heading = [struct.unpack_from("f", data, arrays + j * frames * 4)[0]
+                                          for j in range(7)]
+            valid = struct.unpack_from("i", data, arrays + 7 * frames * 4)[0]
+            if (kind == 1 and valid == 1 and width > 0 and length > 0
+                    and all(math.isfinite(v) for v in (x, y, z, vx, vy, vz, heading, width, length, goal_x, goal_y))
+                    and x != -10000. and y != -10000.
+                    and math.hypot(goal_x - x, goal_y - y) > max(2., goal_radius)):
+                candidates.append((bool(expert), index, object_id))
+            offset = scalars + 28
+        if not candidates:
+            raise ValueError(f"No valid vehicle with an unreached goal for custom replay: {path}")
+        expert, ego_index, ego_id = min(candidates)
+        # Only the header changes. Preserve every object ID, trajectory and road.
+        prepared = data[:16] + struct.pack("2i", ego_index, 0) + data[counts_offset:]
+        (destination / path.name).write_bytes(prepared)
+        selections.append({"map_id": map_id, "scenario_id": scenario_id,
+                           "ego_object_index": ego_index, "ego_object_id": ego_id,
+                           "ego_mark_as_expert": expert, "original_sdc_track_index": original_sdc})
+    validate_maps(destination, num_maps)
+    return ids, selections
+
+
 def validate_sdc(path):
-    """Reject missing/out-of-range SDC indices before C initializes human-replay scenes."""
+    """Validate SDC and WOSAC object indices before initializing the C simulator."""
     with path.open("rb") as handle:
         handle.seek(16)
         header = handle.read(8)
@@ -116,11 +179,16 @@ def validate_sdc(path):
         sdc_index, num_tracks = struct.unpack("2i", header)
         if num_tracks < 0 or 28 + 4 * num_tracks > path.stat().st_size:
             raise ValueError(f"Invalid tracks_to_predict metadata in {path}")
-        handle.seek(4 * num_tracks, 1)
+        track_indices = struct.unpack(f"{num_tracks}i", handle.read(4 * num_tracks))
         num_objects = struct.unpack("i", handle.read(4))[0]
         if not 0 <= sdc_index < num_objects:
             raise ValueError(f"Human-replay requires a valid SDC in {path}: "
                              f"sdc_track_index={sdc_index}, num_objects={num_objects}")
+        invalid = [index for index in track_indices if not 0 <= index < num_objects]
+        if invalid:
+            raise ValueError(f"WOSAC requires valid tracks_to_predict indices in {path}: "
+                             f"invalid={invalid}, num_objects={num_objects}. "
+                             "Repair the JSON metadata mapping and reconvert the scene.")
 
 
 def aggregate_driving(rows):
@@ -196,15 +264,15 @@ def rollout_driving(env, policy, config, seed):
 
 
 def make_env_config(config, options, mode="self_play"):
-    if mode not in METRIC_GROUPS:
+    if mode not in (*METRIC_GROUPS, "custom_replay"):
         raise ValueError(f"Unknown evaluation mode: {mode}")
     env = copy.deepcopy(config["env"])
-    env.update(map_dir=str(options.test_dir), num_maps=options.num_maps,
+    env.update(map_dir=str(getattr(options, "prepared_test_dir", options.test_dir)), num_maps=options.num_maps,
                resample_frequency=0, report_interval=1, termination_mode=0,
                episode_length=91, init_steps=0, control_mode="control_agents",
                init_mode="create_all_valid", seed=options.seed)
     env["defer_reset"] = mode == "wosac"
-    if mode == "human_replay":
+    if mode in ("human_replay", "custom_replay"):
         env["control_mode"] = "control_sdc_only"
     elif mode == "wosac":
         for field in ("init_steps", "control_mode", "init_mode", "goal_behavior", "goal_radius"):
@@ -219,7 +287,6 @@ def evaluate(options, config, scenario_ids, report):
     import numpy as np
     import torch
     from pufferlib.ocean.drive.drive import Drive
-    from pufferlib.ocean.benchmark.evaluator import WOSACEvaluator
 
     if str(options.device).startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; pass --device cpu")
@@ -228,7 +295,10 @@ def evaluate(options, config, scenario_ids, report):
     torch.manual_seed(options.seed)
     config["train"]["device"] = options.device
     config["eval"]["wosac_num_rollouts"] = options.wosac_rollouts
-    env_configs = {mode: make_env_config(config, options, mode) for mode in METRIC_GROUPS}
+    custom = getattr(options, "replay_ego", "sdc") == "custom"
+    replay_mode = "custom_replay" if custom else "human_replay"
+    modes = ("self_play", replay_mode) if custom else tuple(METRIC_GROUPS)
+    env_configs = {mode: make_env_config(config, options, mode) for mode in modes}
     report["settings"] = {
         "device": options.device, "seed": options.seed, "batch_size": options.batch_size,
         "driving_rollouts": options.driving_rollouts, "wosac_rollouts": options.wosac_rollouts,
@@ -240,10 +310,17 @@ def evaluate(options, config, scenario_ids, report):
         "wosac_aggregation": "equal weight per scene; tracks_to_predict only",
         "lstm_reset": "at rollout start only, matching the existing Evaluator",
     }
+    if custom:
+        report["settings"].pop("human_replay_control")
+        report["settings"].pop("wosac_aggregation")
+        report["settings"]["custom_replay_control"] = (
+            "One vehicle valid at frame 0 with finite initial state, positive dimensions and goal distance "
+            "> max(2m, goal_radius); prefer non-expert, then lowest object-list index. "
+            "Other created agents replay logged trajectories. The same selected ego is also included in self-play.")
     policy = None
     wosac_rows = report["per_scene"]["wosac"]
 
-    for mode in ("self_play", "human_replay"):
+    for mode in ("self_play", replay_mode):
         driving_rows = report["per_scene"][mode]
         for start in range(0, options.num_maps, options.batch_size):
             indices = list(range(start, min(start + options.batch_size, options.num_maps)))
@@ -259,15 +336,20 @@ def evaluate(options, config, scenario_ids, report):
                     for map_id, scenario_id, log in zip(indices, expected_ids, logs):
                         keys = (*DRIVING_METRICS, "n", "goals_sampled_this_episode", "goals_reached_this_episode")
                         check_metrics(log, keys)
-                        if mode == "human_replay" and log["n"] != 1:
-                            raise RuntimeError(f"Human-replay must control exactly one SDC in map {map_id}")
+                        if mode == replay_mode and log["n"] != 1:
+                            raise RuntimeError(f"{mode} must control exactly one ego in map {map_id}")
+                        ego_info = report["ego_selection"][map_id] if custom and mode == replay_mode else {}
                         driving_rows.append({"map_id": map_id, "scenario_id": scenario_id, "rollout": rollout,
+                                             **ego_info,
                                              **{key: float(log[key]) for key in keys}})
             finally:
                 env.close()
             report["metrics"][mode] = aggregate_driving(driving_rows)
             print(f"{mode}: {indices[-1] + 1}/{options.num_maps} scenes", flush=True)
 
+    if custom:
+        return
+    from pufferlib.ocean.benchmark.evaluator import WOSACEvaluator
     evaluator = WOSACEvaluator(config)
     for start in range(0, options.num_maps, options.batch_size):
         indices = list(range(start, min(start + options.batch_size, options.num_maps)))
@@ -313,19 +395,28 @@ def main(argv=None):
     for name in ("checkpoint", "test_dir", "output_dir", "config"):
         setattr(options, name, getattr(options, name).expanduser().resolve())
     report = {
-        "schema_version": 2,
+        "schema_version": 3, "replay_ego": options.replay_ego,
         "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(options.checkpoint), "test_dir": str(options.test_dir),
         "config": str(options.config), "requested_scenarios": options.num_maps,
-        "metrics": {mode: {key: None for key in keys} for mode, keys in METRIC_GROUPS.items()},
-        "per_scene": {mode: [] for mode in METRIC_GROUPS},
+        "metrics": {mode: {key: None for key in keys} for mode, keys in metric_groups(options).items()},
+        "per_scene": {mode: [] for mode in metric_groups(options)},
+        "skipped": ({"wosac": "Original tracks_to_predict mapping is not used in custom replay mode"}
+                    if options.replay_ego == "custom" else {}),
     }
     try:
         if not options.checkpoint.is_file():
             raise FileNotFoundError(f"Missing checkpoint: {options.checkpoint}")
-        ids = validate_maps(options.test_dir, options.num_maps)
         config = load_settings(options.config)
-        evaluate(options, config, ids, report)
+        if options.replay_ego == "custom":
+            with tempfile.TemporaryDirectory(prefix="pufferdrive-custom-replay-") as directory:
+                options.prepared_test_dir = Path(directory)
+                ids, report["ego_selection"] = prepare_custom_maps(
+                    options.test_dir, options.prepared_test_dir, options.num_maps, config["env"]["goal_radius"])
+                evaluate(options, config, ids, report)
+        else:
+            ids = validate_maps(options.test_dir, options.num_maps)
+            evaluate(options, config, ids, report)
         report["status"] = "complete"
     except Exception as exc:
         report["status"] = "failed"
@@ -336,11 +427,14 @@ def main(argv=None):
         mode: len({row["scenario_id"] for row in rows}) for mode, rows in report["per_scene"].items()
     }
     report["agent_episodes"] = {
-        mode: sum(row["n"] for row in report["per_scene"][mode]) for mode in ("self_play", "human_replay")
+        mode: sum(row["n"] for row in rows) for mode, rows in report["per_scene"].items() if mode != "wosac"
     }
     path = save_report(report, options.output_dir)
     print(f"\nStatus: {report['status']}")
     for mode, metrics in report["metrics"].items():
+        if mode in report["skipped"]:
+            print(f"\n{mode}: skipped ({report['skipped'][mode]})")
+            continue
         print(f"\n{mode}:")
         for key, value in metrics.items():
             print(f"  {key:26s}: {value:.6f}" if value is not None else f"  {key:26s}: unavailable")

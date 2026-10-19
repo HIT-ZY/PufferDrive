@@ -30,6 +30,7 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(options.test_dir, Path("resources/drive/binaries/testing"))
         self.assertEqual(options.num_maps, 150)
         self.assertEqual(options.wosac_rollouts, 32)
+        self.assertEqual(options.replay_ego, "custom")
 
     def test_agent_weighted_metrics_and_goal_weighted_completion(self):
         rows = [driving_row(1, 1, 3, 2), driving_row(3, 0, 1, 0)]
@@ -68,6 +69,13 @@ class EvaluationTests(unittest.TestCase):
             write_fixture_map(path, 0, 2, sdc_index=1)
             self.assertEqual(evaluation.validate_maps(Path(directory), 1), ["scene_0"])
 
+    def test_wosac_rejects_invalid_track_indices_in_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map_000.bin"
+            write_fixture_map(path, 0, 2, tracks=(34,))
+            with self.assertRaisesRegex(ValueError, "WOSAC requires valid tracks_to_predict"):
+                evaluation.validate_maps(Path(directory), 1)
+
     def test_report_serialization_and_unique_names(self):
         with tempfile.TemporaryDirectory() as directory:
             report = {"status": "complete", "metrics": {"ade": 1.2}}
@@ -84,7 +92,8 @@ class EvaluationTests(unittest.TestCase):
                 self.assertEqual(evaluation.main(args), 1)
             report = json.loads(next((Path(directory) / "out").glob("*.json")).read_text())
             self.assertEqual(report["status"], "failed")
-            self.assertEqual(set(report["metrics"]), {"self_play", "human_replay", "wosac"})
+            self.assertEqual(set(report["metrics"]), {"self_play", "custom_replay", "wosac"})
+            self.assertIn("wosac", report["skipped"])
             self.assertTrue(all(value is None for group in report["metrics"].values() for value in group.values()))
 
     def test_nonfinite_metric_is_rejected(self):
@@ -92,8 +101,17 @@ class EvaluationTests(unittest.TestCase):
             evaluation.check_metrics({"ade": float("nan")}, ["ade"])
 
     def test_three_passes_cover_every_map_and_keep_metrics_separate(self):
+        self.check_passes("sdc")
+
+    def test_custom_replay_runs_two_passes_without_wosac(self):
+        self.check_passes("custom")
+
+    def check_passes(self, replay_ego):
         options = SimpleNamespace(test_dir=Path("test"), checkpoint=Path("model.pt"), num_maps=3,
-                                  batch_size=2, driving_rollouts=2, wosac_rollouts=4, seed=42, device="cpu")
+                                  batch_size=2, driving_rollouts=2, wosac_rollouts=4, seed=42, device="cpu",
+                                  replay_ego=replay_ego)
+        custom = replay_ego == "custom"
+        replay_mode = "custom_replay" if custom else "human_replay"
         config = evaluation.load_settings(ROOT / "pufferlib/config/ocean/drive.ini")
         ids = ["scene_0", "scene_1", "scene_2"]
         instances = []
@@ -132,7 +150,7 @@ class EvaluationTests(unittest.TestCase):
 
         class FakeWosac:
             def __init__(self, config):
-                pass
+                self_test.assertFalse(custom, "Custom replay must not instantiate WOSAC")
 
             def collect_ground_truth_trajectories(self, env):
                 return env.scenario_ids
@@ -152,7 +170,8 @@ class EvaluationTests(unittest.TestCase):
             "pufferlib.ocean.drive.drive": SimpleNamespace(Drive=FakeDrive),
             "pufferlib.ocean.benchmark.evaluator": SimpleNamespace(WOSACEvaluator=FakeWosac),
         }
-        report = {"metrics": {}, "per_scene": {mode: [] for mode in evaluation.METRIC_GROUPS}}
+        report = {"metrics": {}, "per_scene": {mode: [] for mode in evaluation.metric_groups(options)},
+                  "ego_selection": [{"ego_object_index": 1, "ego_object_id": 75} for _ in ids]}
         def fake_rollout(env, *args):
             n, success = (1, 0.25) if env.control_mode == "control_sdc_only" else (2, 1.0)
             return [driving_row(n=n, success=success) for _ in env.map_ids]
@@ -161,18 +180,126 @@ class EvaluationTests(unittest.TestCase):
              patch.object(evaluation, "rollout_driving", side_effect=fake_rollout), \
              contextlib.redirect_stdout(io.StringIO()):
             evaluation.evaluate(options, config, ids, report)
-        self.assertEqual([env.map_ids for env in instances], [[0, 1], [2]] * 3)
+        self.assertEqual([env.map_ids for env in instances], [[0, 1], [2]] * (2 if custom else 3))
         self.assertEqual([env.control_mode for env in instances],
-                         ["control_agents"] * 2 + ["control_sdc_only"] * 2 + ["control_wosac"] * 2)
+                         ["control_agents"] * 2 + ["control_sdc_only"] * 2 + ([] if custom else ["control_wosac"] * 2))
         self.assertTrue(all(env.closed for env in instances))
         self.assertEqual(len(report["per_scene"]["self_play"]), 6)
-        self.assertEqual(len(report["per_scene"]["human_replay"]), 6)
-        self.assertEqual(len(report["per_scene"]["wosac"]), 3)
-        self.assertEqual(set(report["metrics"]), set(evaluation.METRIC_GROUPS))
+        self.assertEqual(len(report["per_scene"][replay_mode]), 6)
+        self.assertEqual(len(report["per_scene"]["wosac"]), 0 if custom else 3)
         self.assertEqual(report["metrics"]["self_play"]["safe_completion_rate"], 1.)
-        self.assertEqual(report["metrics"]["human_replay"]["safe_completion_rate"], 0.25)
-        for mode, keys in evaluation.METRIC_GROUPS.items():
+        self.assertEqual(report["metrics"][replay_mode]["safe_completion_rate"], 0.25)
+        for mode, keys in evaluation.metric_groups(options).items():
+            if custom and mode == "wosac":
+                self.assertNotIn(mode, report["metrics"])
+                continue
             self.assertEqual(set(report["metrics"][mode]), set(keys))
+
+    def test_custom_selection_preserves_source_and_rejects_no_eligible_vehicle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input"
+            source.mkdir()
+            path = source / "map_000.bin"
+            write_fixture_map(path, 0, 2, sdc_index=35, tracks=(34, 6))
+            before = path.read_bytes()
+            destination = Path(directory) / "prepared"
+            ids, selected = evaluation.prepare_custom_maps(source, destination, 1, 2.)
+            self.assertEqual(ids, ["scene_0"])
+            self.assertEqual(selected[0]["ego_object_index"], 0)
+            self.assertEqual(selected[0]["original_sdc_track_index"], 35)
+            self.assertEqual(path.read_bytes(), before)
+            prepared = (destination / path.name).read_bytes()
+            self.assertEqual(struct.unpack_from("2i", prepared, 16), (0, 0))
+            self.assertEqual(prepared[24:], before[32:])  # Only metadata changed.
+            with self.assertRaisesRegex(ValueError, "No valid vehicle"):
+                evaluation.prepare_custom_maps(source, destination, 1, 1000.)
+
+    def test_custom_run_records_selection_and_cleans_temporary_maps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.pt"
+            checkpoint.touch()
+            write_fixture_map(root / "map_000.bin", 0, 2, sdc_index=35, tracks=(34,))
+            temp_paths = []
+            def fake_evaluate(options, config, ids, report):
+                temp_paths.append(options.prepared_test_dir)
+                evaluation.validate_maps(options.prepared_test_dir, 1)
+                self.assertEqual(report["ego_selection"][0]["ego_object_index"], 0)
+                self.assertIn("wosac", report["skipped"])
+                for mode in ("self_play", "custom_replay"):
+                    row = {"scenario_id": ids[0], **driving_row()}
+                    report["per_scene"][mode].append(row)
+                    report["metrics"][mode] = evaluation.aggregate_driving([row])
+            with patch.object(evaluation, "evaluate", side_effect=fake_evaluate), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                code = evaluation.main(["--checkpoint", str(checkpoint), "--test-dir", str(root),
+                                        "--output-dir", str(root / "out"), "--num-maps", "1"])
+            self.assertEqual(code, 0)
+            self.assertFalse(temp_paths[0].exists())
+            report = json.loads(next((root / "out").glob("*.json")).read_text())
+            self.assertEqual(report["coverage"], {"self_play": 1, "custom_replay": 1, "wosac": 0})
+            self.assertTrue(all(v is None for v in report["metrics"]["wosac"].values()))
+
+
+class ConverterMetadataTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Conversion is real Python code; only unused simulator imports are stubbed.
+        importlib.import_module("numpy")  # Keep native module imports outside patch.dict restoration.
+        package = ModuleType("pufferlib")
+        package.PufferEnv = object
+        modules = {"pufferlib": package, "gymnasium": ModuleType("gymnasium"),
+                   "pufferlib.ocean.drive": SimpleNamespace(binding=None)}
+        spec = importlib.util.spec_from_file_location("drive_converter", ROOT / "pufferlib/ocean/drive/drive.py")
+        cls.converter = importlib.util.module_from_spec(spec)
+        with patch.dict("sys.modules", modules):
+            spec.loader.exec_module(cls.converter)
+
+    def test_reported_scene_indices_are_not_guessed_from_ids(self):
+        ids = [0, 5, 7, 8, 12, 14, 15, 25, 27, 28, 33, 35, 38, 40, 42, 43, 46, 47, 49, 50, 73, 74, 75]
+        scene = {"scenario_id": "reported_scene", "objects": [{"id": i} for i in ids],
+                 "metadata": {"sdc_track_index": 35,
+                              "tracks_to_predict": [{"track_index": 34}, {"track_index": 6}]}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map_000.bin"
+            path.write_bytes(b"existing binary")
+            with self.assertRaisesRegex(ValueError, r"sdc_track_index=35.*tracks_to_predict\[0\].track_index=34"):
+                self.converter.save_map_binary(scene, path, 0)
+            self.assertEqual(path.read_bytes(), b"existing binary")
+
+    def test_valid_indices_are_preserved_independently_of_object_ids(self):
+        scene = {"scenario_id": "scene_0", "objects": [{"id": i} for i in (35, 0, 74)],
+                 "metadata": {"sdc_track_index": 1, "tracks_to_predict": [{"track_index": 0}, {"track_index": 2}]}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map_000.bin"
+            self.converter.save_map_binary(scene, path, 0)
+            header = path.read_bytes()[16:40]
+            self.assertEqual(struct.unpack("6i", header), (1, 2, 0, 2, 3, 0))
+            self.assertEqual(evaluation.validate_maps(Path(directory), 1), ["scene_0"])
+
+    def test_invalid_wosac_reference_is_rejected_before_creating_file(self):
+        scene = {"objects": [{"id": 34}, {"id": 6}],
+                 "metadata": {"sdc_track_index": 0, "tracks_to_predict": [{"track_index": 34}]}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map_000.bin"
+            with self.assertRaisesRegex(ValueError, r"tracks_to_predict\[0\].track_index=34"):
+                self.converter.save_map_binary(scene, path, 0)
+            self.assertFalse(path.exists())
+
+    def test_maps_without_waymo_metadata_keep_missing_sdc_sentinel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map_000.bin"
+            self.converter.save_map_binary({"objects": [{"id": 1}]}, path, 0)
+            self.assertEqual(struct.unpack("4i", path.read_bytes()[16:32]), (-1, 0, 1, 0))
+
+    def test_explicit_discard_for_custom_replay_does_not_mutate_json(self):
+        scene = {"objects": [{"id": 35}], "metadata": {"sdc_track_index": 35,
+                 "tracks_to_predict": [{"track_index": 34}]}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map_000.bin"
+            self.converter.save_map_binary(scene, path, 0, discard_track_metadata=True)
+            self.assertEqual(struct.unpack("4i", path.read_bytes()[16:32]), (-1, 0, 1, 0))
+            self.assertEqual(scene["metadata"]["sdc_track_index"], 35)
 
 
 def write_fixture_map(path, map_id, count, sdc_index=None, moving=False, speed=0., tracks=()):
@@ -266,10 +393,28 @@ class NativeMapSelectionTests(unittest.TestCase):
                 self.binding.vec_close(vec)
 
     def test_human_replay_controls_marked_sdc_and_replays_other_vehicle(self):
+        self.check_native_replay(custom=False)
+
+    def test_custom_ego_controls_selected_vehicle_and_others_replay(self):
+        self.check_native_replay(custom=True)
+
+    def check_native_replay(self, custom):
         import numpy as np
 
         with tempfile.TemporaryDirectory() as directory:
-            write_fixture_map(Path(directory) / "map_000.bin", 0, 2, sdc_index=1, moving=True)
+            source = Path(directory) / "map_000.bin"
+            write_fixture_map(source, 0, 2, sdc_index=35 if custom else 1, moving=True)
+            if custom:
+                with source.open("r+b") as handle:
+                    handle.seek(32 + 16 + 8 * 91 * 4 + 24)
+                    handle.write(struct.pack("i", 1))  # Prefer non-expert object 1 as ego.
+                original = source.read_bytes()
+                prepared = Path(directory) / "prepared"
+                _, choices = evaluation.prepare_custom_maps(Path(directory), prepared, 1, 2.)
+                self.assertEqual(choices[0]["ego_object_index"], 1)
+                self.assertEqual(choices[0]["ego_object_id"], 1)
+                self.assertEqual(source.read_bytes(), original)
+                directory = str(prepared)
             offsets, maps, n = self.binding.shared(
                 map_dir=directory, num_agents=1024, num_maps=1, init_mode=0, control_mode=3,
                 init_steps=0, goal_behavior=0, goal_target_distance=30., max_controlled_agents=32,
