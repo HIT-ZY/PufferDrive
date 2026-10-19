@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a checkpoint on every test map, print metrics, and save a JSON report."""
+"""Evaluate one checkpoint: sanity maps, test self-play, WOSAC, then human replay."""
 
 import argparse
 import ast
@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import random
+import statistics
 import struct
 import sys
 import tempfile
@@ -19,21 +20,40 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TEST_DIR = Path("resources/drive/binaries/testing")
 DEFAULT_OUTPUT_DIR = Path("/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results")
+DEFAULT_SANITY_DIR = Path("resources/drive/sanity/sanity_jsons")
+SANITY_MAPS = (
+    "forward_goal_in_front", "reverse_goal_behind", "two_agent_forward_goal_in_front",
+    "two_agent_reverse_goal_behind", "simple_turn", "s_curve", "u_turn",
+    "one_or_two_point_turn", "three_or_four_point_turn", "goal_out_of_sight",
+)
+STAGES = ("sanity", "self_play", "wosac", "human_replay")
 DRIVING_METRICS = (
     "safe_completion_rate", "completion_rate", "collision_rate",
     "offroad_rate", "score", "dnf_rate",
+    "episode_return", "episode_length", "collisions_per_agent", "offroad_per_agent",
+    "lane_alignment_rate", "speed_at_goal", "goals_reached_this_episode",
+    "goals_sampled_this_episode", "perc_controlled", "perc_other",
+)
+DRIVING_TOTALS = ("agent_episodes", "goals_reached_total", "goals_assigned_total")
+WOSAC_FEATURES = (
+    "linear_speed", "linear_acceleration", "angular_speed", "angular_acceleration",
+    "distance_to_nearest_object", "time_to_collision", "collision_indication",
+    "distance_to_road_edge", "offroad_indication",
 )
 WOSAC_METRICS = (
     "realism_meta_score", "ade", "min_ade",
     "kinematic_metrics", "interactive_metrics", "map_based_metrics",
+    *("likelihood_" + key for key in WOSAC_FEATURES),
+    "num_collisions_sim", "num_collisions_ref", "num_offroad_sim", "num_offroad_ref",
+    "num_agents_per_scene",
 )
-METRIC_GROUPS = {"self_play": DRIVING_METRICS, "human_replay": DRIVING_METRICS, "wosac": WOSAC_METRICS}
-
-
-def metric_groups(options):
-    if getattr(options, "replay_ego", "sdc") == "custom":
-        return {"self_play": DRIVING_METRICS, "custom_replay": DRIVING_METRICS, "wosac": WOSAC_METRICS}
-    return METRIC_GROUPS
+WOSAC_TOTALS = ("realism_meta_score_std", "total_num_agents", "total_unique_scenarios")
+METRIC_GROUPS = {
+    "sanity": (*DRIVING_METRICS, *DRIVING_TOTALS, "solved_maps", "evaluated_maps", "solved_rate"),
+    "self_play": (*DRIVING_METRICS, *DRIVING_TOTALS),
+    "wosac": (*WOSAC_METRICS, *WOSAC_TOTALS),
+    "human_replay": (*DRIVING_METRICS, *DRIVING_TOTALS),
+}
 
 
 def positive_int(value):
@@ -50,18 +70,27 @@ def parse_args(argv=None):
                         help="Directory of map_NNN.bin files (default: %(default)s)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
                         help="Directory for the JSON report (default: %(default)s)")
-    parser.add_argument("--num-maps", type=positive_int, default=150)
+    parser.add_argument("--num-maps", type=positive_int, default=1000,
+                        help="Number of test maps (default: 1000)")
     parser.add_argument("--batch-size", type=positive_int, default=8, help="Complete scenes per batch")
     parser.add_argument("--driving-rollouts", type=positive_int, default=1,
                         help="Rollouts per scene for each driving pass (default: 1)")
     parser.add_argument("--wosac-rollouts", type=positive_int, default=32)
     parser.add_argument("--device", default="cuda:0", help="Device, e.g. cuda:0 or cpu (default: %(default)s)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--replay-ego", choices=("custom", "sdc"), default="custom",
-                        help="custom: select a valid vehicle and skip WOSAC; sdc: require original metadata and run WOSAC")
+    parser.add_argument("--stages", nargs="+", choices=STAGES, default=list(STAGES),
+                        help="Stages to run, always in sanity/self_play/wosac/human_replay order")
+    parser.add_argument("--sanity-dir", type=Path, default=DEFAULT_SANITY_DIR,
+                        help="Directory of named sanity JSON scenes (default: %(default)s)")
+    parser.add_argument("--sanity-maps", nargs="+", choices=SANITY_MAPS, default=list(SANITY_MAPS))
+    parser.add_argument("--sanity-rollouts", type=positive_int, default=10,
+                        help="Inference-only episodes per sanity map (default: 10)")
     parser.add_argument("--config", type=Path, default=ROOT / "pufferlib/config/ocean/drive.ini",
                         help="Training INI (architecture and driving reward/goal settings)")
-    return parser.parse_args(argv)
+    options = parser.parse_args(argv)
+    if len(set(options.sanity_maps)) != len(options.sanity_maps):
+        parser.error("--sanity-maps must not contain duplicates")
+    return options
 
 
 def load_settings(path):
@@ -116,59 +145,6 @@ def validate_maps(directory, num_maps, check_indices=True):
     return scenario_ids
 
 
-def prepare_custom_maps(directory, destination, num_maps, goal_radius):
-    """Make temporary map copies with a deterministic ego and no original WOSAC indices."""
-    ids = validate_maps(directory, num_maps, check_indices=False)
-    destination.mkdir(parents=True, exist_ok=True)
-    selections = []
-    for map_id, scenario_id in enumerate(ids):
-        path = directory / f"map_{map_id:03d}.bin"
-        data = path.read_bytes()
-        if len(data) < 32:
-            raise ValueError(f"Truncated map header: {path}")
-        original_sdc, num_tracks = struct.unpack_from("2i", data, 16)
-        counts_offset = 24 + 4 * num_tracks
-        if num_tracks < 0 or counts_offset + 8 > len(data):
-            raise ValueError(f"Invalid track metadata length: {path}")
-        num_objects, num_roads = struct.unpack_from("2i", data, counts_offset)
-        if num_objects < 1 or num_roads < 0:
-            raise ValueError(f"Invalid object counts: {path}")
-        offset = counts_offset + 8
-        candidates = []
-        for index in range(num_objects):
-            if offset + 16 > len(data):
-                raise ValueError(f"Truncated object {index}: {path}")
-            _, kind, object_id, frames = struct.unpack_from("4i", data, offset)
-            # Drive's fixed evaluation horizon requires 91 frames per dynamic object.
-            if kind not in (1, 2, 3) or frames != 91:
-                raise ValueError(f"Unsupported object type/trajectory length at object {index}: {path}")
-            arrays = offset + 16
-            scalars = arrays + 8 * frames * 4
-            if scalars + 28 > len(data):
-                raise ValueError(f"Truncated trajectory for object {index}: {path}")
-            width, length, height, goal_x, goal_y, goal_z, expert = struct.unpack_from("6fi", data, scalars)
-            x, y, z, vx, vy, vz, heading = [struct.unpack_from("f", data, arrays + j * frames * 4)[0]
-                                          for j in range(7)]
-            valid = struct.unpack_from("i", data, arrays + 7 * frames * 4)[0]
-            if (kind == 1 and valid == 1 and width > 0 and length > 0
-                    and all(math.isfinite(v) for v in (x, y, z, vx, vy, vz, heading, width, length, goal_x, goal_y))
-                    and x != -10000. and y != -10000.
-                    and math.hypot(goal_x - x, goal_y - y) > max(2., goal_radius)):
-                candidates.append((bool(expert), index, object_id))
-            offset = scalars + 28
-        if not candidates:
-            raise ValueError(f"No valid vehicle with an unreached goal for custom replay: {path}")
-        expert, ego_index, ego_id = min(candidates)
-        # Only the header changes. Preserve every object ID, trajectory and road.
-        prepared = data[:16] + struct.pack("2i", ego_index, 0) + data[counts_offset:]
-        (destination / path.name).write_bytes(prepared)
-        selections.append({"map_id": map_id, "scenario_id": scenario_id,
-                           "ego_object_index": ego_index, "ego_object_id": ego_id,
-                           "ego_mark_as_expert": expert, "original_sdc_track_index": original_sdc})
-    validate_maps(destination, num_maps)
-    return ids, selections
-
-
 def validate_sdc(path):
     """Validate SDC and WOSAC object indices before initializing the C simulator."""
     with path.open("rb") as handle:
@@ -191,6 +167,101 @@ def validate_sdc(path):
                              "Repair the JSON metadata mapping and reconvert the scene.")
 
 
+def inspect_map(path):
+    """Read object identities/validity without invoking C on unvalidated metadata."""
+    data = path.read_bytes()
+    if len(data) < 32:
+        raise ValueError(f"Truncated map: {path}")
+    sdc, count = struct.unpack_from("2i", data, 16)
+    offset = 24 + 4 * count
+    if count < 0 or offset + 8 > len(data):
+        raise ValueError(f"Invalid track metadata length: {path}")
+    tracks = struct.unpack_from(f"{count}i", data, 24)
+    objects, roads = struct.unpack_from("2i", data, offset)
+    if objects < 1 or roads < 0:
+        raise ValueError(f"Invalid object counts: {path}")
+    offset += 8
+    entities = []
+    for index in range(objects + roads):
+        if offset + 16 > len(data):
+            raise ValueError(f"Truncated entity {index}: {path}")
+        _, kind, object_id, frames = struct.unpack_from("4i", data, offset)
+        dynamic = index < objects
+        if frames < 1 or (dynamic and (frames != 91 or kind not in (1, 2, 3))):
+            raise ValueError(f"Unsupported entity type/trajectory length at {index}: {path}")
+        arrays = offset + 16
+        scalars = arrays + (8 if dynamic else 3) * frames * 4
+        if scalars + 28 > len(data):
+            raise ValueError(f"Truncated entity data at {index}: {path}")
+        if dynamic:
+            entities.append({
+                "index": index, "id": object_id, "kind": kind,
+                "valid": struct.unpack_from(f"{frames}i", data, arrays + 7 * frames * 4),
+                "x": struct.unpack_from(f"{frames}f", data, arrays),
+                "y": struct.unpack_from(f"{frames}f", data, arrays + frames * 4),
+                "heading": struct.unpack_from(f"{frames}f", data, arrays + 6 * frames * 4),
+                "width": struct.unpack_from("f", data, scalars)[0],
+                "length": struct.unpack_from("f", data, scalars + 4)[0],
+            })
+        offset = scalars + 28
+    if len({obj["id"] for obj in entities}) != objects:
+        raise ValueError(f"Duplicate object IDs: {path}")
+    return sdc, tracks, entities
+
+
+def validate_stage_maps(directory, num_maps, mode, init_steps=0):
+    ids = validate_maps(directory, num_maps, check_indices=False)
+    targets = {}
+    egos = []
+    for map_id, scenario_id in enumerate(ids):
+        path = directory / f"map_{map_id:03d}.bin"
+        sdc, tracks, objects = inspect_map(path)
+        # C initializes a nonnegative SDC before its normal validity/type filter.
+        if sdc < -1 or sdc >= len(objects):
+            raise ValueError(f"Invalid SDC index {sdc} for {len(objects)} objects: {path}")
+        if sdc >= 0 and (objects[sdc]["kind"] != 1 or objects[sdc]["valid"][init_steps] != 1):
+            raise ValueError(f"SDC must be a vehicle valid at frame {init_steps}: {path}")
+        if mode == "human_replay":
+            if sdc < 0:
+                raise ValueError(f"Human-replay requires a valid original SDC: {path}. "
+                                 "Check the source metadata and reconvert the scene.")
+            egos.append({"map_id": map_id, "scenario_id": scenario_id,
+                         "ego_object_index": sdc, "ego_object_id": objects[sdc]["id"]})
+        if mode == "wosac":
+            if not tracks or len(set(tracks)) != len(tracks) or any(i < 0 or i >= len(objects) for i in tracks):
+                raise ValueError(f"WOSAC requires nonempty, unique, valid tracks_to_predict indices: {path}")
+            targets[scenario_id] = []
+            for index in tracks:
+                obj = objects[index]
+                if obj["valid"][init_steps] != 1 or not any(obj["valid"][init_steps + 1:]):
+                    raise ValueError(f"WOSAC target {index} lacks valid initial/future reference frames: {path}")
+                if not all(math.isfinite(obj[k][t]) for k in ("x", "y", "heading")
+                           for t in range(init_steps, 91) if obj["valid"][t]):
+                    raise ValueError(f"Non-finite WOSAC reference for target {index}: {path}")
+                if not all(math.isfinite(obj[k]) and obj[k] > 0 for k in ("width", "length")):
+                    raise ValueError(f"Invalid WOSAC target dimensions at {index}: {path}")
+                targets[scenario_id].append(obj["id"])
+    return ids, targets, egos
+
+
+def prepare_sanity_maps(options, destination):
+    """Use the existing JSON converter, keeping source maps and checkpoints untouched."""
+    from pufferlib.ocean.drive.drive import save_map_binary
+
+    destination.mkdir(parents=True, exist_ok=True)
+    names = list(options.sanity_maps)
+    for index, name in enumerate(names):
+        source = options.sanity_dir / f"{name}.json"
+        if not source.is_file():
+            raise FileNotFoundError(f"Missing sanity map: {source}. Restore the sanity resources or set --sanity-dir.")
+        scene = json.loads(source.read_text())
+        # Curated JSONs may share or omit IDs. Give each temporary scene a unique short ID.
+        scene["scenario_id"] = f"sanity_{index:03d}"
+        save_map_binary(scene, destination / f"map_{index:03d}.bin", index)
+    ids, _, _ = validate_stage_maps(destination, len(names), "sanity")
+    return ids, names
+
+
 def aggregate_driving(rows):
     n = sum(row["n"] for row in rows)
     if n <= 0:
@@ -202,13 +273,18 @@ def aggregate_driving(rows):
     if goals <= 0:
         raise ValueError("No assigned goals in driving evaluation")
     result["completion_rate"] = reached / goals
+    result.update(agent_episodes=n, goals_reached_total=reached, goals_assigned_total=goals)
     return result
 
 
 def aggregate_wosac(rows):
     if not rows:
         raise ValueError("No WOSAC scene results")
-    return {key: sum(row[key] for row in rows) / len(rows) for key in WOSAC_METRICS}
+    result = {key: sum(row[key] for row in rows) / len(rows) for key in WOSAC_METRICS}
+    result.update(realism_meta_score_std=statistics.pstdev(row["realism_meta_score"] for row in rows),
+                  total_num_agents=sum(row["num_agents_per_scene"] for row in rows),
+                  total_unique_scenarios=len(rows))
+    return result
 
 
 def check_metrics(row, keys):
@@ -264,7 +340,7 @@ def rollout_driving(env, policy, config, seed):
 
 
 def make_env_config(config, options, mode="self_play"):
-    if mode not in (*METRIC_GROUPS, "custom_replay"):
+    if mode not in METRIC_GROUPS:
         raise ValueError(f"Unknown evaluation mode: {mode}")
     env = copy.deepcopy(config["env"])
     env.update(map_dir=str(getattr(options, "prepared_test_dir", options.test_dir)), num_maps=options.num_maps,
@@ -272,7 +348,7 @@ def make_env_config(config, options, mode="self_play"):
                episode_length=91, init_steps=0, control_mode="control_agents",
                init_mode="create_all_valid", seed=options.seed)
     env["defer_reset"] = mode == "wosac"
-    if mode in ("human_replay", "custom_replay"):
+    if mode == "human_replay":
         env["control_mode"] = "control_sdc_only"
     elif mode == "wosac":
         for field in ("init_steps", "control_mode", "init_mode", "goal_behavior", "goal_radius"):
@@ -282,8 +358,8 @@ def make_env_config(config, options, mode="self_play"):
     return env
 
 
-def evaluate(options, config, scenario_ids, report):
-    # Keep --help, input validation, and aggregation tests independent of RL dependencies.
+def run_stage(options, config, scenario_ids, report, mode, map_names=None, targets=None, egos=None):
+    """One isolated pass; no optimizer, training or checkpoint writes."""
     import numpy as np
     import torch
     from pufferlib.ocean.drive.drive import Drive
@@ -293,134 +369,256 @@ def evaluate(options, config, scenario_ids, report):
     random.seed(options.seed)
     np.random.seed(options.seed)
     torch.manual_seed(options.seed)
-    config["train"]["device"] = options.device
-    config["eval"]["wosac_num_rollouts"] = options.wosac_rollouts
-    custom = getattr(options, "replay_ego", "sdc") == "custom"
-    replay_mode = "custom_replay" if custom else "human_replay"
-    modes = ("self_play", replay_mode) if custom else tuple(METRIC_GROUPS)
-    env_configs = {mode: make_env_config(config, options, mode) for mode in modes}
-    report["settings"] = {
-        "device": options.device, "seed": options.seed, "batch_size": options.batch_size,
-        "driving_rollouts": options.driving_rollouts, "wosac_rollouts": options.wosac_rollouts,
-        **{f"{mode}_env": env_config for mode, env_config in env_configs.items()},
-        "policy_name": config["policy_name"], "rnn_name": config["rnn_name"],
-        "policy": config["policy"], "rnn": config["rnn"],
-        "driving_aggregation": "agent-episode weighted; completion uses total goal counts",
-        "human_replay_control": "dataset SDC only; other agents replay logged trajectories",
-        "wosac_aggregation": "equal weight per scene; tracks_to_predict only",
-        "lstm_reset": "at rollout start only, matching the existing Evaluator",
-    }
-    if custom:
-        report["settings"].pop("human_replay_control")
-        report["settings"].pop("wosac_aggregation")
-        report["settings"]["custom_replay_control"] = (
-            "One vehicle valid at frame 0 with finite initial state, positive dimensions and goal distance "
-            "> max(2m, goal_radius); prefer non-expert, then lowest object-list index. "
-            "Other created agents replay logged trajectories. The same selected ego is also included in self-play.")
+    stage_config = copy.deepcopy(config)
+    stage_config["train"]["device"] = options.device
+    stage_config["eval"]["wosac_num_rollouts"] = options.wosac_rollouts
+    env_config = make_env_config(stage_config, options, mode)
+    report["settings"][f"{mode}_env"] = env_config
+    rows = report["per_scene"][mode]
     policy = None
-    wosac_rows = report["per_scene"]["wosac"]
+    evaluator = None
+    if mode == "wosac":
+        from pufferlib.ocean.benchmark.evaluator import WOSACEvaluator
+        evaluator = WOSACEvaluator(stage_config)
 
-    for mode in ("self_play", replay_mode):
-        driving_rows = report["per_scene"][mode]
-        for start in range(0, options.num_maps, options.batch_size):
-            indices = list(range(start, min(start + options.batch_size, options.num_maps)))
-            expected_ids = [scenario_ids[i] for i in indices]
-            env = Drive(**env_configs[mode], map_ids=indices)
-            try:
-                if env.map_ids != indices or env.scenario_ids != expected_ids:
-                    raise RuntimeError("Explicit map selection failed; rebuild the C extension")
-                if policy is None:
-                    policy = load_policy(config, env, options.checkpoint, options.device)
-                for rollout in range(options.driving_rollouts):
-                    logs = rollout_driving(env, policy, config, options.seed + start + rollout)
-                    for map_id, scenario_id, log in zip(indices, expected_ids, logs):
-                        keys = (*DRIVING_METRICS, "n", "goals_sampled_this_episode", "goals_reached_this_episode")
-                        check_metrics(log, keys)
-                        if mode == replay_mode and log["n"] != 1:
-                            raise RuntimeError(f"{mode} must control exactly one ego in map {map_id}")
-                        ego_info = report["ego_selection"][map_id] if custom and mode == replay_mode else {}
-                        driving_rows.append({"map_id": map_id, "scenario_id": scenario_id, "rollout": rollout,
-                                             **ego_info,
-                                             **{key: float(log[key]) for key in keys}})
-            finally:
-                env.close()
-            report["metrics"][mode] = aggregate_driving(driving_rows)
-            print(f"{mode}: {indices[-1] + 1}/{options.num_maps} scenes", flush=True)
-
-    if custom:
-        return
-    from pufferlib.ocean.benchmark.evaluator import WOSACEvaluator
-    evaluator = WOSACEvaluator(config)
     for start in range(0, options.num_maps, options.batch_size):
         indices = list(range(start, min(start + options.batch_size, options.num_maps)))
         expected_ids = [scenario_ids[i] for i in indices]
-        env = Drive(**env_configs["wosac"], map_ids=indices)
+        env = Drive(**env_config, map_ids=indices)
         try:
             if env.map_ids != indices or env.scenario_ids != expected_ids:
                 raise RuntimeError("Explicit map selection failed; rebuild the C extension")
-            env.reset(seed=options.seed + start)
-            ground_truth = evaluator.collect_ground_truth_trajectories(env)
-            trajectories = evaluator.collect_simulated_trajectories(config, env, policy)
-            results = evaluator.compute_metrics(
-                ground_truth, trajectories, env.get_global_agent_state(), env.get_road_edge_polylines(),
-                aggregate_results=False, drop_last_scenario=False, round_results=False,
-            )
-            if set(results.index) != set(expected_ids) or len(results) != len(indices):
-                missing = sorted(set(expected_ids) - set(results.index))
-                raise RuntimeError(f"Incomplete WOSAC results; missing scenarios: {missing}. "
-                                   "Check tracks_to_predict and valid reference trajectories.")
-            for map_id, scenario_id in zip(indices, expected_ids):
-                row = results.loc[scenario_id].to_dict()
-                check_metrics(row, (*WOSAC_METRICS, "num_agents_per_scene"))
-                wosac_rows.append({"map_id": map_id, "scenario_id": scenario_id,
-                                  **{key: float(value) for key, value in row.items()}})
+            if policy is None:
+                policy = load_policy(stage_config, env, options.checkpoint, options.device)
+            if mode == "wosac":
+                env.reset(seed=options.seed + start)
+                truth = evaluator.collect_ground_truth_trajectories(env)
+                # Do not silently score only a subset when a target was not created by C.
+                for scene_id in expected_ids:
+                    mask = ((truth["scenario_id"][:, 0] == scene_id)
+                            & truth["is_track_to_predict"][:, 0])
+                    actual_ids = set(truth["id"][mask, 0].tolist())
+                    if actual_ids != set(targets[scene_id]):
+                        raise RuntimeError(f"WOSAC target coverage mismatch in {scene_id}: "
+                                           f"expected={targets[scene_id]}, loaded={sorted(actual_ids)}")
+                trajectories = evaluator.collect_simulated_trajectories(stage_config, env, policy)
+                results = evaluator.compute_metrics(
+                    truth, trajectories, env.get_global_agent_state(), env.get_road_edge_polylines(),
+                    aggregate_results=False, drop_last_scenario=False, round_results=False,
+                )
+                if set(results.index) != set(expected_ids) or len(results) != len(indices):
+                    missing = sorted(set(expected_ids) - set(results.index))
+                    raise RuntimeError(f"Incomplete WOSAC results; missing scenarios: {missing}")
+                for map_id, scene_id in zip(indices, expected_ids):
+                    row = results.loc[scene_id].to_dict()
+                    check_metrics(row, WOSAC_METRICS)
+                    if row["num_agents_per_scene"] != len(targets[scene_id]):
+                        raise RuntimeError(f"Incomplete WOSAC target count in {scene_id}")
+                    rows.append({"map_id": map_id, "scenario_id": scene_id,
+                                 **{key: float(value) for key, value in row.items()}})
+                report["metrics"][mode] = aggregate_wosac(rows)
+            else:
+                rollouts = options.sanity_rollouts if mode == "sanity" else options.driving_rollouts
+                for rollout in range(rollouts):
+                    logs = rollout_driving(env, policy, stage_config, options.seed + start + rollout)
+                    if len(logs) != len(indices):
+                        raise RuntimeError(f"Missing scene logs in {mode}")
+                    for map_id, scene_id, log in zip(indices, expected_ids, logs):
+                        check_metrics(log, (*DRIVING_METRICS, "n"))
+                        if log["n"] <= 0:
+                            raise RuntimeError(f"No completed agent episodes in map {map_id}")
+                        if mode == "human_replay" and log["n"] != 1:
+                            raise RuntimeError(f"{mode} must control exactly one ego in map {map_id}")
+                        row = {"map_id": map_id, "scenario_id": scene_id, "rollout": rollout,
+                               **{key: float(log[key]) for key in (*DRIVING_METRICS, "n")}}
+                        if map_names is not None:
+                            row["map_name"] = map_names[map_id]
+                        if egos is not None:
+                            row.update(egos[map_id])
+                        rows.append(row)
+                report["metrics"][mode] = aggregate_driving(rows)
+                if mode == "sanity":
+                    summarize_sanity(report, options.sanity_rollouts)
         finally:
             env.close()
-        report["metrics"]["wosac"] = aggregate_wosac(wosac_rows)
-        print(f"\nWOSAC: {indices[-1] + 1}/{options.num_maps} scenes", flush=True)
+        print(f"{mode}: {indices[-1] + 1}/{options.num_maps} scenes", flush=True)
 
 
-def save_report(report, directory):
-    directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = directory / f"test_metrics_{stamp}_{uuid.uuid4().hex[:8]}.json"
+def summarize_sanity(report, rollouts):
+    by_map = {}
+    for row in report["per_scene"]["sanity"]:
+        by_map.setdefault(row["map_name"], []).append(row)
+    summaries = []
+    for name, rows in by_map.items():
+        metrics = aggregate_driving(rows)
+        complete = len(rows) == rollouts and len({row["rollout"] for row in rows}) == rollouts
+        summaries.append({"map_name": name, "metrics": metrics, "rollouts_completed": len(rows),
+                          "solved": metrics["score"] >= 0.95 if complete else None})
+    report["sanity_results"] = summaries
+    completed = [row for row in summaries if row["solved"] is not None]
+    solved = sum(row["solved"] for row in completed)
+    report["metrics"]["sanity"].update(solved_maps=solved, evaluated_maps=len(completed),
+                                      solved_rate=solved / len(completed) if completed else None)
+
+
+def evaluate(options, config, report):
+    """Run selected stages in fixed order; one stage's failure never hides other results."""
+    report["settings"] = {
+        "device": options.device, "seed": options.seed, "batch_size": options.batch_size,
+        "driving_rollouts": options.driving_rollouts, "sanity_rollouts": options.sanity_rollouts,
+        "wosac_rollouts": options.wosac_rollouts, "inference_only": True,
+        "policy_name": config["policy_name"], "rnn_name": config["rnn_name"],
+        "policy": config["policy"], "rnn": config["rnn"],
+        "driving_aggregation": "agent-episode weighted; completion uses total goal counts",
+        "wosac_aggregation": "equal weight per scene; original tracks_to_predict only; population std",
+        "human_replay_control": "original dataset SDC only; other created agents replay logged trajectories",
+        "sanity_solved_rule": "per-map mean score >= 0.95; not a safe-completion threshold",
+        "lstm_reset": "zero at rollout start only; no history warm-up or per-agent reset on respawn",
+    }
+    for mode in STAGES:
+        status = report["stages"][mode]
+        if mode not in options.stages:
+            status["status"] = "skipped"
+            report["skipped"][mode] = "Not selected by --stages"
+            continue
+        print(f"\nStarting {mode}", flush=True)
+        status.update(status="running", started_at=datetime.now(timezone.utc).isoformat())
+        stage_options = copy.copy(options)
+        names, targets, egos = None, None, None
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"pufferdrive-{mode}-") as directory:
+                if mode == "sanity":
+                    stage_options.num_maps = len(options.sanity_maps)
+                    stage_options.prepared_test_dir = Path(directory)
+                    ids, names = prepare_sanity_maps(options, Path(directory))
+                else:
+                    init_steps = config["eval"]["wosac_init_steps"] if mode == "wosac" else 0
+                    ids, targets, egos = validate_stage_maps(options.test_dir, options.num_maps, mode, init_steps)
+                    if mode == "human_replay":
+                        report["ego_selection"] = egos
+                    if mode == "wosac":
+                        report["wosac_targets"] = targets
+                run_stage(stage_options, config, ids, report, mode, names, targets, egos or None)
+                rows = report["per_scene"][mode]
+                repeat = (1 if mode == "wosac" else options.sanity_rollouts if mode == "sanity"
+                          else options.driving_rollouts)
+                if (len(rows) != stage_options.num_maps * repeat
+                        or {row["scenario_id"] for row in rows} != set(ids)):
+                    raise RuntimeError(f"Incomplete {mode} coverage")
+            status["status"] = "complete"
+        except Exception as exc:
+            status.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+            print(f"{mode}: {status['error']}", file=sys.stderr, flush=True)
+        status["finished_at"] = datetime.now(timezone.utc).isoformat()
+        rows = report["per_scene"][mode]
+        if rows:
+            report["metrics"][mode] = aggregate_wosac(rows) if mode == "wosac" else aggregate_driving(rows)
+            if mode == "sanity":
+                summarize_sanity(report, options.sanity_rollouts)
+        status["coverage"] = len({row["scenario_id"] for row in rows})
+        # Save progress to the same run file after each stage, including failures.
+        if "report_path" in report:
+            write_report(report, Path(report["report_path"]))
+
+
+def write_report(report, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
     temporary.replace(path)
+
+
+def save_report(report, directory):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = directory / f"test_metrics_{stamp}_{uuid.uuid4().hex[:8]}.json"
+    write_report(report, path)
     return path
+
+
+def new_report(options):
+    groups = METRIC_GROUPS
+    stages = {}
+    for mode in groups:
+        stages[mode] = {"status": "pending" if mode in options.stages else "skipped",
+                        "requested_scenarios": len(options.sanity_maps) if mode == "sanity" else options.num_maps,
+                        "coverage": 0}
+    return {
+        "schema_version": 4, "replay_ego": "sdc",
+        "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
+        "checkpoint": str(options.checkpoint), "test_dir": str(options.test_dir),
+        "sanity_dir": str(options.sanity_dir), "sanity_maps": options.sanity_maps,
+        "config": str(options.config), "requested_scenarios": options.num_maps,
+        "stage_order": list(groups), "stages": stages,
+        "metrics": {mode: {key: None for key in keys} for mode, keys in groups.items()},
+        "per_scene": {mode: [] for mode in groups}, "sanity_results": [],
+        "skipped": {mode: "Not selected by --stages" for mode, stage in stages.items()
+                    if stage["status"] == "skipped"},
+        "metric_notes": {
+            "driving": "Rates and means are agent-episode weighted; completion is total reached / assigned goals.",
+            "episode_return": "Native simulator log; goal reward branches may overwrite earlier return. Not a strict sum of all rewards.",
+            "episode_length": "Mean native episode length in simulation steps.",
+            "collisions_per_agent": "Mean number of steps classified as vehicle collision, not distinct collision events.",
+            "offroad_per_agent": "Mean number of steps classified as offroad, not distinct offroad events.",
+            "lane_alignment_rate": "Fraction aligned on the final logged step; not a time average.",
+            "speed_at_goal": "Last recorded goal speed (m/s), averaged over all agent episodes; non-finishers contribute zero.",
+            "goals_reached_this_episode": "Mean native completed-goal counter per agent episode; respawn repeats follow native counting rules.",
+            "goals_sampled_this_episode": "Mean assigned-goal counter per agent episode.",
+            "perc_controlled": "Agent-episode weighted controlled fraction of created scene actors, in [0, 1].",
+            "perc_other": "Agent-episode weighted background fraction of created scene actors, in [0, 1].",
+            "sanity": "Inference only; solved if per-map mean score >= 0.95 after all requested rollouts.",
+            "wosac": "Project WOSAC implementation with local wosac.ini weights; original prediction targets only. "
+                     "ADE/minADE are in metres and excluded from realism_meta_score. likelihood_* are exponentiated log-likelihood scores.",
+            "num_collisions_sim": "Scene mean per-agent probability of any collision over simulated rollouts (not an event count).",
+            "num_collisions_ref": "Scene fraction of reference agents with any collision.",
+            "num_offroad_sim": "Scene mean per-agent probability of any offroad event over simulated rollouts.",
+            "num_offroad_ref": "Scene fraction of reference agents with any offroad event.",
+            "realism_meta_score_std": "Population standard deviation across evaluated scenes (zero for one scene).",
+            "total_num_agents": "Scored WOSAC objects summed across scenes, not multiplied by rollout count.",
+        },
+    }
+
+
+def print_report(report, path):
+    print(f"\nStatus: {report['status']}")
+    for mode, metrics in report["metrics"].items():
+        stage = report["stages"][mode]
+        print(f"\n{mode}: {stage['status']} ({stage['coverage']}/{stage['requested_scenarios']} scenes)")
+        if "error" in stage:
+            print(f"  Error: {stage['error']}")
+        if mode in report["skipped"]:
+            print(f"  {report['skipped'][mode]}")
+            continue
+        for key, value in metrics.items():
+            print(f"  {key:38s}: {value:.6f}" if value is not None else f"  {key:38s}: unavailable")
+        if mode == "sanity":
+            for item in report["sanity_results"]:
+                result = "incomplete" if item["solved"] is None else "solved" if item["solved"] else "unsolved"
+                print(f"  {item['map_name']}: {result}")
+                for key, value in item["metrics"].items():
+                    print(f"    {key:36s}: {value:.6f}")
+    print(f"Saved: {path}")
 
 
 def main(argv=None):
     options = parse_args(argv)
-    for name in ("checkpoint", "test_dir", "output_dir", "config"):
+    for name in ("checkpoint", "test_dir", "output_dir", "config", "sanity_dir"):
         setattr(options, name, getattr(options, name).expanduser().resolve())
-    report = {
-        "schema_version": 3, "replay_ego": options.replay_ego,
-        "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
-        "checkpoint": str(options.checkpoint), "test_dir": str(options.test_dir),
-        "config": str(options.config), "requested_scenarios": options.num_maps,
-        "metrics": {mode: {key: None for key in keys} for mode, keys in metric_groups(options).items()},
-        "per_scene": {mode: [] for mode in metric_groups(options)},
-        "skipped": ({"wosac": "Original tracks_to_predict mapping is not used in custom replay mode"}
-                    if options.replay_ego == "custom" else {}),
-    }
+    report = new_report(options)
+    path = save_report(report, options.output_dir)
+    report["report_path"] = str(path)
     try:
         if not options.checkpoint.is_file():
             raise FileNotFoundError(f"Missing checkpoint: {options.checkpoint}")
         config = load_settings(options.config)
-        if options.replay_ego == "custom":
-            with tempfile.TemporaryDirectory(prefix="pufferdrive-custom-replay-") as directory:
-                options.prepared_test_dir = Path(directory)
-                ids, report["ego_selection"] = prepare_custom_maps(
-                    options.test_dir, options.prepared_test_dir, options.num_maps, config["env"]["goal_radius"])
-                evaluate(options, config, ids, report)
-        else:
-            ids = validate_maps(options.test_dir, options.num_maps)
-            evaluate(options, config, ids, report)
-        report["status"] = "complete"
+        evaluate(options, config, report)
+        report["status"] = ("failed" if any(stage["status"] not in ("complete", "skipped")
+                                           for stage in report["stages"].values()) else "complete")
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
+        for stage in report["stages"].values():
+            if stage["status"] in ("pending", "running"):
+                stage.update(status="failed", error=report["error"])
         print(report["error"], file=sys.stderr)
     report["finished_at"] = datetime.now(timezone.utc).isoformat()
     report["coverage"] = {
@@ -429,17 +627,8 @@ def main(argv=None):
     report["agent_episodes"] = {
         mode: sum(row["n"] for row in rows) for mode, rows in report["per_scene"].items() if mode != "wosac"
     }
-    path = save_report(report, options.output_dir)
-    print(f"\nStatus: {report['status']}")
-    for mode, metrics in report["metrics"].items():
-        if mode in report["skipped"]:
-            print(f"\n{mode}: skipped ({report['skipped'][mode]})")
-            continue
-        print(f"\n{mode}:")
-        for key, value in metrics.items():
-            print(f"  {key:26s}: {value:.6f}" if value is not None else f"  {key:26s}: unavailable")
-    print(f"Coverage: {report['coverage']} / {options.num_maps} requested scenes")
-    print(f"Saved: {path}")
+    write_report(report, path)
+    print_report(report, path)
     return 0 if report["status"] == "complete" else 1
 
 

@@ -2,143 +2,193 @@
 
 Driving is a safety-critical multi-agent application, making careful evaluation and risk assessment essential. Mistakes in the real world are costly, so simulations are used to catch errors before deployment. To support rapid iteration, evaluations should ideally run efficiently. This is why we also paid attention to optimizing the speed of the evaluations. This page contains an overview of the available benchmarks and evals.
 
-## Evaluate all 150 test scenes
+## Four-stage checkpoint evaluation
 
-Run the standalone evaluator from the repository root:
-
-```bash
-python scripts/evaluate_test.py \
-  --checkpoint /path/to/model.pt
-```
-
-The defaults are 150 maps, `cuda:0`, test directory
-`resources/drive/binaries/testing`, and output directory
-`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results`.
-The existing resource symlink should resolve the test directory to
-`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/resources/drive/binaries/testing`.
-Verify it with `readlink -f resources/drive/binaries/testing`.
-Override paths with `--test-dir` and `--output-dir`, or use `--device cpu`.
-
-By default, `--replay-ego custom` runs two passes in sequence:
-
-- `self_play`: the policy controls eligible agents, including the selected ego.
-- `custom_replay`: the policy controls exactly one selected vehicle per scene;
-  other created agents follow their logged trajectories.
-
-Both groups report `safe_completion_rate`, `completion_rate`, `collision_rate`,
-`offroad_rate`, `score`, and `dnf_rate`. WOSAC is explicitly skipped in custom
-mode because this mode discards the original track-index metadata.
-
-The ego is selected deterministically from vehicles valid at frame 0, with a
-finite initial state, positive width and length, and a goal farther away than
-`max(2 metres, goal_radius)`. Among eligible vehicles, selection prefers those
-not marked as expert, then takes the lowest index in the current object list.
-If all eligible vehicles are marked as expert, the first of those is selected.
-A scene without an eligible vehicle causes an error. Selection does not rotate
-through vehicles or change randomly between rollouts. With the default one
-rollout per scene, custom replay evaluates 150 ego episodes.
-
-Existing BIN files need no reconversion for custom replay, even if their original
-SDC or prediction indices are out of range. The evaluator creates temporary map
-copies, writes the selected ego index into the SDC slot, and clears prediction
-indices. Object IDs, trajectories, roads, and the source files remain unchanged.
-Both driving passes use these copies, and they are deleted after evaluation.
-The selected vehicle is a custom ego, not a recovered dataset SDC.
-
-### Converting raw JSON for custom replay
-
-If the BIN files do not exist yet, use the existing converter:
+Run from the repository root:
 
 ```bash
-python pufferlib/ocean/drive/drive.py \
-  --data-folder /mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/testing \
-  --output-dir /mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/resources/drive/binaries/testing \
-  --discard-track-metadata \
-  --workers 8
+python scripts/evaluate_test.py --checkpoint /path/to/model.pt
 ```
 
-`--discard-track-metadata` writes an unset SDC index and no prediction indices;
-it is intended for custom replay when the original mapping is unavailable.
-It does not modify source JSON. Omit this flag to preserve correctly mapped
-metadata for the original SDC/WOSAC protocol. Conversion does not change resource
-links. Missing input or failed conversions raise an error. Running the converter
-without arguments keeps its original training defaults.
+The script evaluates the **same checkpoint without training** in this order:
 
-The evaluator requires exactly `map_000.bin` through `map_149.bin`, with distinct
-scenario IDs and 91-frame reference trajectories. Use `--num-maps N` for a
-different dataset size. Raw JSON files cannot be used directly.
+1. `sanity`: the ten curated basic maps, ten episodes per map by default.
+2. `self_play`: every test scene, with eligible agents controlled by the policy.
+3. `wosac`: every test scene, using the project's distributional realism metrics.
+4. `human_replay`: every test scene, controlling the original dataset SDC while
+   the other created agents follow logged trajectories.
 
-### Original SDC and WOSAC protocol
+Each stage creates and closes its own environments and reloads the same checkpoint.
+The INI's training-time evaluation enable flags do not control this script.
+Each rollout resets the environment and LSTM state. No optimizer is created and
+weights are not updated. The LSTM is not warmed up with logged history, and its
+state is not reset separately on an individual agent respawn.
 
-For data with verified original track mappings, enable all three passes:
+### Inputs and defaults
+
+| Option | Default |
+| --- | --- |
+| `--test-dir` | `resources/drive/binaries/testing` |
+| `--num-maps` | `1000`, requiring exactly `map_000.bin` through `map_999.bin` |
+| `--sanity-dir` | `resources/drive/sanity/sanity_jsons` |
+| `--sanity-maps` | All ten named maps listed below |
+| `--sanity-rollouts` | `10` episodes per basic map |
+| `--driving-rollouts` | `1` episode per test scene in each driving stage |
+| `--wosac-rollouts` | `32` simulations per test scene |
+| `--batch-size` | `8` complete scenes |
+| `--device` | `cuda:0` |
+| `--seed` | `42` |
+| `--output-dir` | `/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results` |
+
+The current resource link points to
+`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/pufferdrive_womd_1k/resources`.
+Check the server with `readlink -f resources`. Switching the entire resource
+link also changes where sanity JSONs are found. If the new directory contains
+only BIN data, restore `drive/sanity/sanity_jsons`, or pass `--sanity-dir` with
+the original resource location. Missing sanity resources produce a failed sanity
+stage; the subsequent stages still run. The script does not substitute invented
+maps for missing resources.
+
+Sanity JSONs are converted with the existing `save_map_binary` function into a
+temporary directory with unique scene IDs. Original JSONs and BIN files are not
+modified. Each basic map receives a separate summary. `solved` means its mean
+`score >= 0.95` after all requested rollouts; this is not the strict safe-completion
+criterion. A low score is a valid evaluation result, not an execution failure.
+Unlike `puffer sanity`, this stage **does not train a new model on each map**.
+
+Select a subset of basic maps:
 
 ```bash
-python scripts/evaluate_test.py \
-  --checkpoint /path/to/model.pt \
-  --replay-ego sdc
+python scripts/evaluate_test.py --checkpoint /path/to/model.pt \
+  --sanity-maps forward_goal_in_front s_curve
 ```
 
-This runs `self_play`, `human_replay` (the dataset SDC only), and `wosac`, in that
-order. Human replay reports the same six driving metrics; WOSAC reports
-`realism_meta_score`, `ade`, `min_ade`, `kinematic_metrics`,
-`interactive_metrics`, and `map_based_metrics`.
+Select stages explicitly, for example to omit the basic maps:
 
-SDC and `tracks_to_predict` metadata must use positions in the current objects
-list, not object IDs or positions in an earlier, unfiltered track list. The
-converter rejects out-of-range indices unless metadata is explicitly discarded.
-If objects were filtered without updating metadata, recover the original
-track-index-to-object-ID mapping from the source scenario and remap both fields.
-An object with `id=35` is not necessarily the original track at index 35.
-Passing a bounds check alone cannot establish that the mapping is correct.
-WOSAC also requires future reference trajectories and valid prediction targets.
+```bash
+python scripts/evaluate_test.py --checkpoint /path/to/model.pt \
+  --stages self_play wosac human_replay
+```
 
-### Execution and saved results
+Selected stages always follow the four-stage order, regardless of argument order.
+Use `--config /path/to/drive.ini` if the checkpoint uses different architecture,
+action-space or reward settings. This config is merged over `config/default.ini`.
 
-The script covers maps in index order without random map sampling or partial
-scenes. Each pass creates and closes its own environments and uses independent
-settings. The INI's evaluation enable flags do not control this script.
-Defaults are 8 complete scenes per batch, one episode per scene in each driving
-pass, and 32 rollouts per scene when WOSAC is enabled. Use `--batch-size`,
-`--driving-rollouts`, and `--wosac-rollouts` to change those counts.
-If a checkpoint uses a different architecture, action space, or reward/goal
-configuration, supply its INI with `--config /path/to/drive.ini`; it is merged
-over `pufferlib/config/default.ini`.
+### Driving metrics: sanity, self-play and human replay
 
-A uniquely named `test_metrics_<UTC timestamp>_<id>.json` contains metrics,
-checkpoint/config paths, effective settings, coverage, and per-scene results.
-The report uses `schema_version: 3`. In custom mode, `metrics`, `per_scene`, and
-`coverage` contain `self_play`, `custom_replay`, and `wosac` entries.
-`ego_selection` records each scene's selected object index and ID, expert flag,
-and original SDC index. For example, read custom replay success from
-`report["metrics"]["custom_replay"]["safe_completion_rate"]`.
-Skipped WOSAC metrics are `null`, its coverage is 0, and `skipped.wosac` explains
-why. With `--replay-ego sdc`, `human_replay` replaces `custom_replay` and all
-three groups run.
+All native fields exported by the Drive log binding are retained per scene and
+rollout. The following appear in the terminal and JSON summary:
 
-`agent_episodes` records separate counts for the two driving passes.
-Driving rates are weighted by agent episode counts within each pass; completion
-is computed from total completed/assigned goals. Results from the two driving
-modes are never pooled. Enabled WOSAC metrics are averaged equally across scenes,
-retaining full precision.
+| Metric | Meaning |
+| --- | --- |
+| `safe_completion_rate` | Agent fraction completing all assigned goals without any collision/offroad event over the whole scene episode. Higher is better. |
+| `completion_rate` | Total completed goals / total assigned goals. Higher is better. |
+| `collision_rate` | Agent fraction with any vehicle collision. Lower is better. |
+| `offroad_rate` | Agent fraction with any offroad event. Lower is better. |
+| `score` | Original environment success rule, which is less strict than safe completion. |
+| `dnf_rate` | Agent fraction with no collision/offroad event but incomplete goals. Lower is better. |
+| `episode_return` | Native return log. The current simulator can overwrite earlier return in a goal-reward branch, so this is not a strict cumulative reward sum. |
+| `episode_length` | Mean logged episode length, in simulation steps. |
+| `collisions_per_agent` | Mean number of steps classified as vehicle collision, not distinct collision events. |
+| `offroad_per_agent` | Mean number of steps classified as offroad, not distinct offroad events. |
+| `lane_alignment_rate` | Agent fraction aligned on the last logged step, not a time average. |
+| `speed_at_goal` | Last recorded speed at a reached goal, in m/s; averaged over all agent episodes, including zero for non-finishers. |
+| `goals_reached_this_episode` | Mean native completed-goal count per agent episode. Respawn repeats follow native counting rules. |
+| `goals_sampled_this_episode` | Mean assigned-goal count per agent episode. |
+| `perc_controlled` | Controlled fraction of created scene actors, in `[0, 1]`. |
+| `perc_other` | Background fraction of created scene actors, in `[0, 1]`. |
+| `agent_episodes` | Total completed controlled-agent episodes, summed from native `n`. |
+| `goals_reached_total` | Total counted completed goals. |
+| `goals_assigned_total` | Total assigned goals. |
 
-Both driving passes start at step 0 for the 90 transitions of a 91-frame scene,
-with the configured driving rewards and goal behavior. WOSAC uses the separate
-`wosac_*` settings (by default step 10, `control_wosac`, and stop at the goal).
-Each pass resets LSTM state at rollout start, with no per-agent reset on respawn,
-matching the existing evaluator.
+Rates and means are weighted by each row's native `n` agent count. Completion is
+recomputed from total goal counts; stages are never pooled together. `n` remains
+in every per-scene row. Sanity additionally reports `solved_maps`,
+`evaluated_maps`, `solved_rate`, and per-map metrics and solved status. Incomplete
+map rollouts are not labelled solved.
 
-WOSAC retains the final simulation state until the next explicit reset
-(`defer_reset=True`). From frame 10, it records 81 states through frame 90 with
-80 policy steps. Driving passes use automatic reset and collect their episode
-logs at the boundary. In `goal_behavior=2` (stop), each assigned goal is counted
-as completed only once, even if the agent stays at the goal for many steps.
+These stages start at frame 0 and execute 90 transitions of a 91-frame scene.
+They preserve the configured goal/reward behavior (default: respawn at the goal),
+while disabling early scene termination and map resampling.
 
-Missing scenes, missing results from an enabled pass, or invalid metrics cause
-a nonzero exit and `status: "failed"`; partial results and coverage remain
-available. `status: "complete"` means all enabled passes covered the requested
-dataset: two in custom mode, three in SDC mode. No WandB account or rendering is
-required. Rebuild the C extension after native code updates with
-`python setup.py build_ext --inplace --force`.
+### Full WOSAC metric output
+
+WOSAC uses `wosac_*` settings: by default frame 10 initialization,
+`control_wosac`, `create_all_valid`, and stop at the goal. Each rollout collects
+81 states through frame 90 using 80 actions (8 simulated seconds at `dt=0.1`).
+`defer_reset=True` keeps the final frame intact. Only original `tracks_to_predict`
+objects are scored, though other simulated participants affect interactions.
+This is the project's implementation with its local `wosac.ini` weights, not a
+submission to an external benchmark server.
+
+| Metric | Meaning |
+| --- | --- |
+| `realism_meta_score` | Weighted composite of the feature likelihood scores. Higher is better. |
+| `ade` | Mean displacement error over valid reference frames and rollouts, in metres. Lower is better. |
+| `min_ade` | Best rollout ADE per scored object, then averaged. Lower is better. |
+| `kinematic_metrics` | Mean of the four motion likelihood scores. |
+| `interactive_metrics` | Mean of nearest-object, TTC and collision likelihood scores. |
+| `map_based_metrics` | Mean of road-edge distance and offroad likelihood scores. |
+| `likelihood_linear_speed` | Linear-speed realism score. |
+| `likelihood_linear_acceleration` | Linear-acceleration realism score. |
+| `likelihood_angular_speed` | Angular-speed realism score. |
+| `likelihood_angular_acceleration` | Angular-acceleration realism score. |
+| `likelihood_distance_to_nearest_object` | Nearest-object distance realism score. |
+| `likelihood_time_to_collision` | Time-to-collision realism score. |
+| `likelihood_collision_indication` | Any-collision event realism score. |
+| `likelihood_distance_to_road_edge` | Road-edge distance realism score. |
+| `likelihood_offroad_indication` | Any-offroad event realism score. |
+| `num_collisions_sim` / `num_collisions_ref` | Simulated/reference any-collision fractions; despite their names, these are not event counts. |
+| `num_offroad_sim` / `num_offroad_ref` | Simulated/reference any-offroad fractions. |
+| `num_agents_per_scene` | Mean number of scored objects per scene; per-scene rows retain the individual counts. |
+| `realism_meta_score_std` | Population standard deviation over scene scores, zero for one scene. |
+| `total_num_agents` | Scored objects summed across scenes, not multiplied by rollout count. |
+| `total_unique_scenarios` | Number of scored scenes. |
+
+`likelihood_*` are exponentiated log-likelihood scores, higher is better.
+ADE/minADE are not part of the composite. The current implementation does not
+calculate a traffic-light violation score. WOSAC summaries weight scenes equally
+and retain full precision. Every requested scene and prediction target must be
+represented; missing targets, including those excluded by simulator capacity,
+produce a failed stage instead of silently changing the scoring population.
+
+### SDC and prediction metadata
+
+Self-play allows an unset SDC (`-1`); a nonnegative SDC must be a valid vehicle
+index. Human replay requires the original SDC to be valid at frame 0. WOSAC requires
+valid, nonempty prediction indices and valid initial/future reference trajectories.
+SDC and prediction indices must refer to the current object list. An object ID
+is not necessarily its list index, and passing bounds checks cannot establish
+that an upstream mapping is semantically correct.
+
+The converter preserves the SDC and prediction indices from the source JSON:
+
+```bash
+python pufferlib/ocean/drive/drive.py --data-folder /path/to/testing_jsons \
+  --output-dir resources/drive/binaries/testing --workers 8
+```
+
+Human replay always controls the vehicle identified by the original
+`sdc_track_index`; all other vehicles replay their logged trajectories. Its
+object-list index and object ID are recorded in `ego_selection`. Missing or
+invalid SDC metadata fails this stage. The evaluator never selects a replacement
+vehicle or rewrites the test maps.
+
+### Reports and failure handling
+
+The terminal prints all metrics, stage status and coverage, plus individual
+sanity-map results. One `test_metrics_<UTC timestamp>_<id>.json` is saved under
+`--output-dir` and atomically updated after each stage. Report `schema_version: 4`
+contains `stage_order`, `stages`, `settings`, `metric_notes`, `metrics`, `per_scene`,
+`sanity_results`, coverage, ego selections and WOSAC target IDs where applicable.
+Each stage has its own requested scene count (ten basic maps versus 1000 test
+scenes by default).
+
+A failed stage records its error and partial results; later stages still run.
+Unavailable metrics are `null`, not invented zeroes. An explicitly omitted stage
+is `skipped` with a reason. Overall `status: complete` and exit code 0 require all
+selected stages to complete. Low driving scores or unsolved basic tasks do not
+make execution fail. No WandB account or rendering is required.
 
 ## Safe goal completion
 
@@ -162,19 +212,23 @@ Rebuild the C extension after updating: `python setup.py build_ext --inplace --f
 
 ## Sanity maps 🐛
 
-Quickly test the training on curated, lightweight scenarios without downloading the full dataset. Each sanity map tests a specific behavior.
+This original command starts a separate training run on each selected map.
+It inherits the configured training budget; set `--train.total-timesteps` for a
+short run. It differs from the inference-only sanity stage in `evaluate_test.py`.
+Disable training-time evaluations if you want no dependency on the full dataset.
+Each sanity map tests a specific behavior.
 
 ```bash
-puffer sanity puffer_drive --wandb --wandb-name sanity-demo --sanity-maps forward_goal_in_front s_curve
+puffer sanity puffer_drive --wandb --sanity-maps forward_goal_in_front s_curve
 ```
 
 Or run them all at once:
 
 ```bash
-puffer sanity puffer_drive --wandb --wandb-name sanity-all
+puffer sanity puffer_drive --wandb
 ```
 
-- Tip: turn learning-rate annealing off for these short runs (`--train.anneal_lr False`) to keep the sanity checks from decaying the optimizer mid-run.
+- Tip: turn learning-rate annealing off for these short runs (`--train.anneal-lr False`) to keep the sanity checks from decaying the optimizer mid-run.
 
 Available maps:
 
@@ -208,7 +262,7 @@ See [the WOSAC benchmark page](wosac.md) for the metric pipeline and all the det
 You may be interested in how compatible your agent is with human partners. For this purpose, we support an eval where your policy only controls the self-driving car (SDC). The rest of the agents in the scene are stepped using the logs. While it is not a perfect eval since the human partners here are static, it will still give you a sense of how closely aligned your agent's behavior is to how people drive. You can run it like this:
 
 ```bash
-puffer eval puffer_drive --eval.human-replay-eval True --load-model-path <path_to_checkpoint>.pt
+python scripts/evaluate_test.py --stages human_replay --checkpoint <path_to_checkpoint>.pt
 ```
 
 During this evaluation the self-driving car (SDC) is controlled by your policy while other agents replay log trajectories.
