@@ -386,6 +386,124 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(report["metrics"]["self_play"]["agent_episodes"], 2)
             self.assertEqual(report["stages"]["human_replay"]["status"], "complete")
 
+    def test_aggregation_failure_does_not_stop_later_stages(self):
+        for rollout_failed in (False, True):
+            with self.subTest(rollout_failed=rollout_failed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "model.pt").touch()
+                write_fixture_map(root / "map_000.bin", 0, 2)
+                seen = []
+
+                def fake_stage(options, config, ids, report, mode, *args):
+                    seen.append(mode)
+                    row = driving_row(goals=0, reached=0) if mode == "self_play" else driving_row()
+                    report["per_scene"][mode].append({"scenario_id": ids[0], "rollout": 0, **row})
+                    if mode == "self_play":
+                        # A stale earlier-batch summary must not survive this failure.
+                        report["metrics"][mode] = evaluation.aggregate_driving([driving_row()])
+                        if rollout_failed:
+                            raise RuntimeError("Rollout failed")
+
+                with patch.object(evaluation, "run_stage", side_effect=fake_stage), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = evaluation.main([
+                        "--checkpoint", str(root / "model.pt"), "--test-dir", str(root),
+                        "--output-dir", str(root / "out"), "--num-maps", "1",
+                        "--stages", "self_play", "human_replay",
+                    ])
+                self.assertEqual(code, 1)
+                report = json.loads(next((root / "out").glob("*.json")).read_text())
+                self.assertEqual(seen, ["self_play", "human_replay"])
+                self.assertEqual(report["stages"]["self_play"]["status"], "failed")
+                self.assertIn("No assigned goals", report["stages"]["self_play"]["aggregation_error"])
+                if rollout_failed:
+                    self.assertIn("Rollout failed", report["stages"]["self_play"]["error"])
+                self.assertTrue(all(value is None for value in report["metrics"]["self_play"].values()))
+                self.assertEqual(len(report["per_scene"]["self_play"]), 1)
+                self.assertEqual(report["stages"]["self_play"]["coverage"], 1)
+                self.assertEqual(report["stages"]["human_replay"]["status"], "complete")
+
+
+class WosacInputValidationTests(unittest.TestCase):
+    def setUp(self):
+        import numpy as np
+
+        self.truth = {key: np.zeros((2, 1, 81), dtype=np.float32) for key in ("x", "y", "heading")}
+        self.truth["x"][1] = 10.
+        self.truth.update(
+            valid=np.ones((2, 1, 81), dtype=bool), id=np.array([[35], [75]]),
+            is_vehicle=np.ones((2, 1), dtype=bool), is_track_to_predict=np.ones((2, 1), dtype=bool),
+            scenario_id=np.array([["scene_0"], ["scene_0"]]),
+        )
+        self.sim = {key: np.repeat(self.truth[key], 2, axis=1) for key in ("x", "y", "heading")}
+        self.sim["id"] = np.broadcast_to(self.truth["id"][:, :, None], (2, 2, 81)).copy()
+        self.state = {"length": np.full(2, 4.), "width": np.full(2, 2.)}
+        self.edges = {"x": np.array([-200., 200.]), "y": np.array([-10., -10.]),
+                      "lengths": np.array([2]), "scenario_id": np.array(["scene_0"])}
+
+    def compute(self, benchmark):
+        evaluator = benchmark.WOSACEvaluator({"train": {"device": "cpu"}, "eval": {"wosac_init_steps": 10}})
+        return evaluator.compute_metrics(self.truth, self.sim, self.state, self.edges,
+                                         drop_last_scenario=False, round_results=False)
+
+    def test_nonfinite_simulation_cannot_be_hidden_by_scene_averaging(self):
+        import numpy as np
+
+        with benchmark_module() as benchmark:
+            # Previously pandas skipped the broken object's ADE and reported 0
+            # while still counting both objects in num_agents_per_scene.
+            self.sim["x"][0, 0] = np.nan
+            with self.assertRaisesRegex(ValueError, "Non-finite simulated x.*object 35.*rollout 0.*frame 10"):
+                self.compute(benchmark)
+
+    def test_nonfinite_interaction_partner_is_also_rejected(self):
+        import numpy as np
+
+        self.truth["is_track_to_predict"][1] = False
+        with benchmark_module() as benchmark:
+            for field in ("x", "y", "heading"):
+                for source, label in ((self.sim, "simulated"), (self.truth, "reference")):
+                    with self.subTest(field=field, source=label):
+                        original = source[field][1, 0, 20]
+                        source[field][1, 0, 20] = np.inf
+                        with self.assertRaisesRegex(ValueError, f"Non-finite {label} {field}.*object 75"):
+                            self.compute(benchmark)
+                        source[field][1, 0, 20] = original
+
+    def test_invalid_reference_frames_may_have_missing_coordinates(self):
+        import numpy as np
+
+        self.truth["valid"][0, 0, -1] = False
+        for field in ("x", "y", "heading"):
+            self.truth[field][0, 0, -1] = np.nan
+        with benchmark_module() as benchmark:
+            row = self.compute(benchmark).loc["scene_0"].to_dict()
+        evaluation.check_metrics(row, evaluation.WOSAC_METRICS)
+        self.assertEqual(row["ade"], 0.)
+
+    def test_invalid_dimensions_are_rejected(self):
+        import numpy as np
+
+        with benchmark_module() as benchmark:
+            for value in (0., -1., np.nan, np.inf):
+                with self.subTest(value=value):
+                    self.state["width"][1] = value
+                    with self.assertRaisesRegex(ValueError, "finite, positive agent width"):
+                        self.compute(benchmark)
+
+    def test_wosac_reports_undefined_ttc_for_nonvehicle_only_targets(self):
+        self.truth["is_vehicle"][:] = False
+        with benchmark_module() as benchmark:
+            with self.assertRaisesRegex(ValueError, "likelihood_time_to_collision.*scene_0.*vehicle"):
+                self.compute(benchmark)
+
+    def test_wosac_mixed_targets_exclude_nonvehicles_only_from_ttc(self):
+        self.truth["is_vehicle"][1] = False
+        with benchmark_module() as benchmark:
+            row = self.compute(benchmark).loc["scene_0"].to_dict()
+        evaluation.check_metrics(row, evaluation.WOSAC_METRICS)
+        self.assertEqual(row["num_agents_per_scene"], 2)
+        self.assertEqual(row["ade"], 0.)
 
 
 class ConverterMetadataTests(unittest.TestCase):
@@ -474,7 +592,8 @@ class ConverterMetadataTests(unittest.TestCase):
                     evaluation.prepare_sanity_maps(options, root / "missing-output")
 
 
-def write_fixture_map(path, map_id, count, sdc_index=None, moving=False, speed=0., tracks=()):
+def write_fixture_map(path, map_id, count, sdc_index=None, moving=False, speed=0., tracks=(),
+                      goal_distance=None):
     """Tiny real binary map: valid stationary vehicles with distant goals."""
     with path.open("wb") as handle:
         handle.write(struct.pack("16s", f"scene_{map_id}".encode()))
@@ -490,7 +609,8 @@ def write_fixture_map(path, map_id, count, sdc_index=None, moving=False, speed=0
                            [0.] * 91, [speed] * 91, [0.] * 91, [0.] * 91):
                 handle.write(struct.pack("91f", *values))
             handle.write(struct.pack("91i", *([1] * 91)))
-            handle.write(struct.pack("6fi", 2., 4., 1., 100., 0., 0., 0))
+            goal_x = 100. if goal_distance is None else i * 10. + goal_distance
+            handle.write(struct.pack("6fi", 2., 4., 1., goal_x, 0., 0., 0))
         # Lane geometry gives the real simulator a finite map extent.
         handle.write(struct.pack("4i", map_id, 4, 100, 2))
         handle.write(struct.pack("6f", -200., 200., -10., 10., 0., 0.))
@@ -566,11 +686,25 @@ class NativeMapSelectionTests(unittest.TestCase):
                 self.binding.vec_close(vec)
 
     def test_human_replay_controls_marked_sdc_and_replays_other_vehicle(self):
+        self.check_human_replay()
+
+    def test_human_replay_resumes_after_a_missing_log_frame(self):
+        self.check_human_replay(missing_frame=True)
+
+    def check_human_replay(self, missing_frame=False):
         import numpy as np
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "map_000.bin"
             write_fixture_map(source, 0, 2, sdc_index=1, moving=True)
+            # The replay partner accelerates; the policy-controlled SDC starts still.
+            data = bytearray(source.read_bytes())
+            arrays = 32 + 16  # Map header without prediction targets, then first entity header.
+            struct.pack_into("91f", data, arrays, *(0.1 * t + 0.05 * t * t for t in range(91)))
+            struct.pack_into("91f", data, arrays + 3 * 91 * 4, *(1. + t for t in range(91)))
+            if missing_frame:
+                struct.pack_into("i", data, arrays + 7 * 91 * 4 + 2 * 4, 0)
+            source.write_bytes(data)
             offsets, maps, n = self.binding.shared(
                 map_dir=directory, num_agents=1024, num_maps=1, init_mode=0, control_mode=3,
                 init_steps=0, goal_behavior=0, goal_target_distance=30., max_controlled_agents=32,
@@ -587,17 +721,26 @@ class NativeMapSelectionTests(unittest.TestCase):
             kwargs.update(map_dir=directory, map_id=0, max_agents=1, human_agent_idx=0,
                           ini_file=str(ROOT / "pufferlib/config/ocean/drive.ini"),
                           action_type=0, dynamics_model=0, control_mode=3, init_mode=0,
-                          episode_length=3, termination_mode=0)
+                          episode_length=5 if missing_frame else 3, termination_mode=0)
             env = self.binding.env_init(obs, actions, rewards, terminals, truncations, 42, **kwargs)
             vec = self.binding.vectorize(env)
             try:
                 self.binding.vec_reset(vec, 42)
                 partner_x = self.binding.EGO_FEATURES_CLASSIC
                 self.assertAlmostEqual(float(obs[0, partner_x]), -10. * 0.02, places=5)
+                self.assertAlmostEqual(float(obs[0, partner_x + 6]), 1. / 100., places=5)
                 self.binding.vec_step(vec)
-                # Object 1 (SDC) stays still; object 0 follows its logged x(t=1)=0.1.
-                self.assertAlmostEqual(float(obs[0, partner_x]), -9.9 * 0.02, places=5)
+                # Object 1 stays still; object 0 replays both x(t=1)=0.15 and vx(t=1)=2.
+                self.assertAlmostEqual(float(obs[0, partner_x]), -9.85 * 0.02, places=5)
+                self.assertAlmostEqual(float(obs[0, partner_x + 6]), 2. / 100., places=5)
                 self.binding.vec_step(vec)
+                if missing_frame:
+                    np.testing.assert_array_equal(obs[0, partner_x:partner_x + 7], 0.)
+                    self.binding.vec_step(vec)
+                    self.assertAlmostEqual(float(obs[0, partner_x]), -9.25 * 0.02, places=5)
+                    self.assertAlmostEqual(float(obs[0, partner_x + 6]), 4. / 100., places=5)
+                    self.binding.vec_step(vec)
+                self.assertAlmostEqual(float(obs[0, partner_x + 6]), 1. / 100., places=5)
                 log = self.binding.env_log(env, 0)
                 self.assertEqual(log["n"], 1)
                 self.assertEqual(log["perc_controlled"], 0.5)
@@ -621,6 +764,32 @@ class NativeMapSelectionTests(unittest.TestCase):
                 self.assertEqual(row["completion_rate"], 1.)
             finally:
                 env.close()
+
+    def test_return_sums_emitted_rewards_across_goal_completion(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as directory:
+            write_fixture_map(Path(directory) / "map_000.bin", 0, 2, goal_distance=0.24)
+            for goal_behavior in (0, 2):  # Respawn and stop.
+                with self.subTest(goal_behavior=goal_behavior):
+                    env = NativeDriveHarness(self.binding, directory, init_steps=0,
+                                             episode_length=5, goal_radius=0.01,
+                                             goal_behavior=goal_behavior)
+                    try:
+                        env.reset()
+                        # Accelerate straight ahead; both agents reach the goal on step 3.
+                        actions = np.full_like(env.actions, 84)
+                        rewards = [env.step(actions)[1].copy() for _ in range(4)]
+                        self.assertTrue((rewards[0] < 0).all())
+                        self.assertTrue((rewards[1] < 0).all())
+                        np.testing.assert_array_equal(rewards[2], 1.)
+                        self.assertTrue(env.truncations.all())
+                        row = self.binding.env_log(env.handle, 2)
+                        self.assertEqual(row["goals_reached_this_episode"], 1.)
+                        self.assertAlmostEqual(row["episode_return"],
+                                               np.asarray(rewards).sum(axis=0).mean(), places=6)
+                    finally:
+                        env.close()
 
     def test_wosac_retains_last_frame_and_computes_real_metrics(self):
         import numpy as np
@@ -687,7 +856,8 @@ def benchmark_module():
 class NativeDriveHarness:
     """Minimal adapter around the real C simulator for CPU trajectory tests."""
 
-    def __init__(self, binding, directory, init_steps, episode_length=91, goal_radius=2.):
+    def __init__(self, binding, directory, init_steps, episode_length=91, goal_radius=2.,
+                 goal_behavior=2):
         import numpy as np
 
         self.binding = binding
@@ -708,7 +878,7 @@ class NativeDriveHarness:
                       ini_file=str(ROOT / "pufferlib/config/ocean/drive.ini"),
                       action_type=0, dynamics_model=0, control_mode=2, init_mode=0,
                       init_steps=init_steps, episode_length=episode_length, termination_mode=0,
-                      goal_behavior=2, goal_radius=goal_radius, defer_reset=True)
+                      goal_behavior=goal_behavior, goal_radius=goal_radius, defer_reset=True)
         self.handle = binding.env_init(self.obs, self.actions, self.rewards, self.terminals,
                                        self.truncations, 42, **kwargs)
         self.vec = binding.vectorize(self.handle)

@@ -317,6 +317,26 @@ class WOSACEvaluator:
         is_vehicle = ground_truth_trajectories["is_vehicle"]
         scenario_ids = ground_truth_trajectories["scenario_id"]
 
+        # Histogram estimators and pandas means can silently discard NaNs.
+        # Check every simulated participant, including interaction partners,
+        # before those reductions can turn a failed rollout into a finite score.
+        for field in ("x", "y", "heading"):
+            for label, values, valid in (
+                ("simulated", simulated_trajectories[field], True),
+                ("reference", ground_truth_trajectories[field], ref_valid.astype(bool)),
+            ):
+                bad = ~np.isfinite(values) & valid
+                if np.any(bad):
+                    agent, rollout, step = np.argwhere(bad)[0]
+                    raise ValueError(
+                        f"Non-finite {label} {field} in scenario {scenario_ids[agent, 0]}, "
+                        f"object {ground_truth_trajectories['id'][agent, 0]}, "
+                        f"rollout {rollout}, frame {self.init_steps + step}"
+                    )
+        for field, values in (("length", agent_length), ("width", agent_width)):
+            if np.any(~np.isfinite(values) | (values <= 0)):
+                raise ValueError(f"WOSAC requires finite, positive agent {field}")
+
         last_scenario_id = str(scenario_ids[-1][0])
 
         # We evaluate the metrics only for the Tracks to Predict.
@@ -600,15 +620,33 @@ class WOSACEvaluator:
             }
         )
 
-        # Aggregate along agent dimenision: Obtain one score per scenario
-        df_scene_level = df.groupby("scenario_id", as_index=True).mean().drop(columns=["agent_id"]).dropna()
+        # Aggregate along agent dimension: Obtain one score per scenario.
+        df_scene_level = df.groupby("scenario_id", as_index=True).mean().drop(columns=["agent_id"])
+        # The legacy batch evaluator may end with a partially loaded scene.
+        if drop_last_scenario and last_scenario_id in df_scene_level.index:
+            df_scene_level = df_scene_level.drop(last_scenario_id)
+
+        # A scene with no eligible samples for a feature has no defined score.
+        # Dropping the row here silently loses its other, valid metrics as well.
+        missing = df_scene_level.isna().to_numpy()
+        if missing.any():
+            row, column = np.argwhere(missing)[0]
+            metric = df_scene_level.columns[column]
+            reason = ("TTC requires a vehicle among the prediction targets."
+                      if metric == "likelihood_time_to_collision"
+                      else "No valid reference samples are available for this metric.")
+            raise ValueError(
+                f"Undefined WOSAC metric {metric} in scenario {df_scene_level.index[row]}. {reason}"
+            )
 
         # Exponentiate the averaged log-likelihoods to get final likelihoods
         likelihood_columns = [col for col in df_scene_level.columns if col.startswith("likelihood_")]
         df_scene_level[likelihood_columns] = np.exp(df_scene_level[likelihood_columns])
 
         df_scene_level["realism_meta_score"] = df_scene_level.apply(self._compute_metametric, axis=1)
-        df_scene_level["num_agents_per_scene"] = df.groupby("scenario_id").size()
+        df_scene_level["num_agents_per_scene"] = (
+            df.groupby("scenario_id").size().reindex(df_scene_level.index)
+        )
 
         # Get group summary metrics
         kinematic_metrics = np.mean(
@@ -641,10 +679,6 @@ class WOSACEvaluator:
         df_scene_level["kinematic_metrics"] = kinematic_metrics
         df_scene_level["interactive_metrics"] = interactive_metrics
         df_scene_level["map_based_metrics"] = map_metrics
-
-        # Safety: drop the last scenario (potentially incomplete) from the scene-level results
-        if drop_last_scenario and last_scenario_id in df_scene_level.index:
-            df_scene_level = df_scene_level.drop(last_scenario_id)
 
         if round_results:
             df_scene_level = df_scene_level.round(3)

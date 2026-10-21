@@ -522,15 +522,17 @@ void set_start_position(Drive *env) {
         if (e->type > CYCLIST || e->type == 0) {
             continue;
         }
-        if (is_active == 0) {
+        if (is_active == 0 && e->mark_as_expert != 1) {
             e->vx = 0;
             e->vy = 0;
             e->vz = 0;
-            e->collided_before_goal = 0;
         } else {
             e->vx = e->traj_vx[env->init_steps];
             e->vy = e->traj_vy[env->init_steps];
             e->vz = e->traj_vz[env->init_steps];
+        }
+        if (is_active == 0) {
+            e->collided_before_goal = 0;
         }
         e->heading = e->traj_heading[env->init_steps];
         e->heading_x = cosf(e->heading);
@@ -848,6 +850,7 @@ void move_expert(Drive *env, float *actions, int agent_idx) {
         agent->x = INVALID_POSITION;
         agent->y = INVALID_POSITION;
         agent->z = 0.0f;
+        agent->vx = agent->vy = agent->vz = 0.0f;
         agent->heading = 0.0f;
         agent->heading_x = 1.0f;
         agent->heading_y = 0.0f;
@@ -857,6 +860,7 @@ void move_expert(Drive *env, float *actions, int agent_idx) {
         agent->x = INVALID_POSITION;
         agent->y = INVALID_POSITION;
         agent->z = 0.0f;
+        agent->vx = agent->vy = agent->vz = 0.0f;
         agent->heading = 0.0f;
         agent->heading_x = 1.0f;
         agent->heading_y = 0.0f;
@@ -865,6 +869,9 @@ void move_expert(Drive *env, float *actions, int agent_idx) {
     agent->x = agent->traj_x[t];
     agent->y = agent->traj_y[t];
     agent->z = agent->traj_z[t];
+    agent->vx = agent->traj_vx[t];
+    agent->vy = agent->traj_vy[t];
+    agent->vz = agent->traj_vz[t];
     agent->heading = agent->traj_heading[t];
     agent->heading_x = cosf(agent->heading);
     agent->heading_y = sinf(agent->heading);
@@ -1423,7 +1430,7 @@ void remove_bad_trajectories(Drive *env) {
         }
         for (int i = 0; i < env->expert_static_agent_count; i++) {
             int expert_idx = env->expert_static_agent_indices[i];
-            if (env->entities[expert_idx].x == INVALID_POSITION)
+            if (env->entities[expert_idx].traj_x[env->init_steps] == INVALID_POSITION)
                 continue;
             move_expert(env, env->actions, expert_idx);
         }
@@ -2106,7 +2113,9 @@ void c_step(Drive *env) {
     // Move static experts
     for (int i = 0; i < env->expert_static_agent_count; i++) {
         int expert_idx = env->expert_static_agent_indices[i];
-        if (env->entities[expert_idx].x == INVALID_POSITION)
+        // Preserve excluded trajectories, but resume after temporary log gaps.
+        // move_expert checks validity for the current frame on every call.
+        if (env->entities[expert_idx].traj_x[env->init_steps] == INVALID_POSITION)
             continue;
         move_expert(env, env->actions, expert_idx);
     }
@@ -2127,7 +2136,6 @@ void c_step(Drive *env) {
             float delta_vy = env->entities[agent_idx].vy - prev_vy;
             float jerk_penalty = -0.0002f * sqrtf(delta_vx * delta_vx + delta_vy * delta_vy) / env->dt;
             env->rewards[i] += jerk_penalty;
-            env->logs[i].episode_return += jerk_penalty;
         }
     }
 
@@ -2142,12 +2150,10 @@ void c_step(Drive *env) {
         if (collision_state > 0) {
             if (collision_state == VEHICLE_COLLISION) {
                 env->rewards[i] += env->reward_vehicle_collision;
-                env->logs[i].episode_return += env->reward_vehicle_collision;
                 env->logs[i].collision_rate = 1.0f;
                 env->logs[i].collisions_per_agent += 1.0f;
             } else if (collision_state == OFFROAD) {
                 env->rewards[i] += env->reward_offroad_collision;
-                env->logs[i].episode_return += env->reward_offroad_collision;
                 env->logs[i].offroad_rate = 1.0f;
                 env->logs[i].offroad_per_agent += 1.0f;
             }
@@ -2169,11 +2175,9 @@ void c_step(Drive *env) {
         if (within_distance && within_speed && !env->entities[agent_idx].current_goal_reached) {
             if (env->goal_behavior == GOAL_RESPAWN && env->entities[agent_idx].respawn_timestep != -1) {
                 env->rewards[i] += env->reward_goal_post_respawn;
-                env->logs[i].episode_return += env->reward_goal_post_respawn;
                 env->entities[agent_idx].current_goal_reached = 1;
             } else if (env->goal_behavior == GOAL_GENERATE_NEW && (!env->entities[agent_idx].current_goal_reached)) {
                 env->rewards[i] += env->reward_goal;
-                env->logs[i].episode_return += env->reward_goal;
                 sample_new_goal(env, agent_idx);
                 env->entities[agent_idx].current_goal_reached = 0;
                 env->entities[agent_idx].goals_reached_this_episode += 1.0f;
@@ -2182,7 +2186,6 @@ void c_step(Drive *env) {
                     env->entities[agent_idx].current_goal_reached = 1;
                 }
                 env->rewards[i] = env->reward_goal;
-                env->logs[i].episode_return = env->reward_goal;
                 env->entities[agent_idx].stopped = 1;
                 env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
                 env->entities[agent_idx].goals_reached_this_episode += 1.0f;
@@ -2191,6 +2194,9 @@ void c_step(Drive *env) {
             env->logs[i].speed_at_goal = current_speed;
         }
 
+        // Sum the final emitted reward exactly once. Goal rewards can replace
+        // this step's penalties, but must not erase earlier steps' returns.
+        env->logs[i].episode_return += env->rewards[i];
         int lane_aligned = env->entities[agent_idx].metrics_array[LANE_ALIGNED_IDX];
         env->logs[i].lane_alignment_rate = lane_aligned;
     }

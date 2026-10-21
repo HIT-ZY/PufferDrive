@@ -87,7 +87,7 @@ rollout. The following appear in the terminal and JSON summary:
 | `offroad_rate` | Agent fraction with any offroad event. Lower is better. |
 | `score` | Original environment success rule, which is less strict than safe completion. |
 | `dnf_rate` | Agent fraction with no collision/offroad event but incomplete goals. Lower is better. |
-| `episode_return` | Native return log. The current simulator can overwrite earlier return in a goal-reward branch, so this is not a strict cumulative reward sum. |
+| `episode_return` | Mean sum of the rewards emitted at each step over a controlled-agent scene episode, including steps after goal respawn. |
 | `episode_length` | Mean logged episode length, in simulation steps. |
 | `collisions_per_agent` | Mean number of steps classified as vehicle collision, not distinct collision events. |
 | `offroad_per_agent` | Mean number of steps classified as offroad, not distinct offroad events. |
@@ -121,6 +121,11 @@ objects are scored, though other simulated participants affect interactions.
 This is the project's implementation with its local `wosac.ini` weights, not a
 submission to an external benchmark server.
 
+TTC is scored only for vehicle prediction targets. A scene whose prediction
+targets are all pedestrians/cyclists has no defined TTC score. Evaluation reports
+the scene ID and undefined metric as an error; it does not discard the scene or
+substitute a score. Other stages can still run independently.
+
 | Metric | Meaning |
 | --- | --- |
 | `realism_meta_score` | Weighted composite of the feature likelihood scores. Higher is better. |
@@ -151,6 +156,11 @@ calculate a traffic-light violation score. WOSAC summaries weight scenes equally
 and retain full precision. Every requested scene and prediction target must be
 represented; missing targets, including those excluded by simulator capacity,
 produce a failed stage instead of silently changing the scoring population.
+Before metric computation, all simulated participants must have finite positions
+and headings, and finite positive dimensions. Reference positions and headings
+must be finite on valid frames, including those of interaction partners.
+Non-finite trajectories fail the stage rather than being silently omitted from
+histograms or scene averages.
 
 ### SDC and prediction metadata
 
@@ -185,6 +195,9 @@ Each stage has its own requested scene count (ten basic maps versus 1000 test
 scenes by default).
 
 A failed stage records its error and partial results; later stages still run.
+If partial results cannot be aggregated, their per-scene rows remain in the report,
+the stage records `aggregation_error`, and its summary metrics are reset to `null`.
+An earlier batch's summary is never presented as the final summary for those rows.
 Unavailable metrics are `null`, not invented zeroes. An explicitly omitted stage
 is `skipped` with a reason. Overall `status: complete` and exit code 0 require all
 selected stages to complete. Low driving scores or unsolved basic tasks do not

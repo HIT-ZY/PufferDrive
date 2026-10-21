@@ -65,6 +65,14 @@ def test_time_to_collision_output_shape():
             [6, 10, 3, 1],
             [MAX_TTC_SEC, 1 / 7, 1 / 2, MAX_TTC_SEC],
         ),
+        # Both vehicles travel west; equivalent headings straddle the +/-pi boundary.
+        (
+            [[0, 0], [-5, 0]],
+            [math.pi, -math.pi],
+            [[4, 2]] * 2,
+            [6, 3],
+            [1 / 3, MAX_TTC_SEC],
+        ),
         # Test ignore misaligned
         (
             [[0, 0], [5, 0], [10, 0], [15, 0]],

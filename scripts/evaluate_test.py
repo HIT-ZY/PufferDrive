@@ -509,12 +509,25 @@ def evaluate(options, config, report):
         except Exception as exc:
             status.update(status="failed", error=f"{type(exc).__name__}: {exc}")
             print(f"{mode}: {status['error']}", file=sys.stderr, flush=True)
-        status["finished_at"] = datetime.now(timezone.utc).isoformat()
         rows = report["per_scene"][mode]
         if rows:
-            report["metrics"][mode] = aggregate_wosac(rows) if mode == "wosac" else aggregate_driving(rows)
-            if mode == "sanity":
-                summarize_sanity(report, options.sanity_rollouts)
+            try:
+                summary = aggregate_wosac(rows) if mode == "wosac" else aggregate_driving(rows)
+                check_metrics(summary, WOSAC_METRICS if mode == "wosac" else DRIVING_METRICS)
+                report["metrics"][mode] = summary
+                if mode == "sanity":
+                    summarize_sanity(report, options.sanity_rollouts)
+            except Exception as exc:
+                # Partial results can also be unaggregatable. Keep the failure
+                # inside this stage and do not publish an earlier batch's summary.
+                error = f"{type(exc).__name__}: {exc}"
+                status.update(status="failed", aggregation_error=error)
+                status.setdefault("error", error)
+                report["metrics"][mode] = {key: None for key in METRIC_GROUPS[mode]}
+                if mode == "sanity":
+                    report["sanity_results"] = []
+                print(f"{mode}: aggregation failed: {error}", file=sys.stderr, flush=True)
+        status["finished_at"] = datetime.now(timezone.utc).isoformat()
         status["coverage"] = len({row["scenario_id"] for row in rows})
         # Save progress to the same run file after each stage, including failures.
         if "report_path" in report:
@@ -555,7 +568,7 @@ def new_report(options):
                     if stage["status"] == "skipped"},
         "metric_notes": {
             "driving": "Rates and means are agent-episode weighted; completion is total reached / assigned goals.",
-            "episode_return": "Native simulator log; goal reward branches may overwrite earlier return. Not a strict sum of all rewards.",
+            "episode_return": "Mean sum of the rewards emitted at each step over a controlled-agent scene episode.",
             "episode_length": "Mean native episode length in simulation steps.",
             "collisions_per_agent": "Mean number of steps classified as vehicle collision, not distinct collision events.",
             "offroad_per_agent": "Mean number of steps classified as offroad, not distinct offroad events.",

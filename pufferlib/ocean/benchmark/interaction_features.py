@@ -223,7 +223,9 @@ def compute_time_to_collision(
     ego_heading = heading[:, eval_indices]
     ego_speed = speed[:, eval_indices]
 
-    yaw_diff = torch.abs(heading.unsqueeze(1) - ego_heading.unsqueeze(2))
+    yaw_diff = heading.unsqueeze(1) - ego_heading.unsqueeze(2)
+    # Compare directions on the circle: +pi and -pi are the same heading.
+    yaw_diff = torch.abs(torch.remainder(yaw_diff + math.pi, 2 * math.pi) - math.pi)
 
     yaw_diff_cos = torch.cos(yaw_diff)
     yaw_diff_sin = torch.sin(yaw_diff)
