@@ -591,6 +591,24 @@ class ConverterMetadataTests(unittest.TestCase):
                 with self.assertRaisesRegex(FileNotFoundError, "Missing sanity map"):
                     evaluation.prepare_sanity_maps(options, root / "missing-output")
 
+    def test_curated_sanity_does_not_use_stale_waymo_indices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            name = "three_or_four_point_turn"
+            source = root / f"{name}.json"
+            source.write_text(json.dumps({
+                "objects": [{"id": 999, "type": "vehicle"}], "roads": [],
+                "metadata": {"sdc_track_index": 32, "tracks_to_predict": [{"track_index": 40}]},
+            }))
+            original = source.read_bytes()
+            options = SimpleNamespace(sanity_dir=root, sanity_maps=[name])
+            with patch.dict("sys.modules", {"pufferlib.ocean.drive.drive": self.converter}):
+                evaluation.prepare_sanity_maps(options, root / "prepared")
+            sdc, tracks, objects = evaluation.inspect_map(root / "prepared/map_000.bin")
+            self.assertEqual((sdc, tracks), (-1, ()))
+            self.assertEqual([obj["id"] for obj in objects], [999])
+            self.assertEqual(source.read_bytes(), original)
+
 
 def write_fixture_map(path, map_id, count, sdc_index=None, moving=False, speed=0., tracks=(),
                       goal_distance=None):
@@ -649,6 +667,35 @@ class NativeMapSelectionTests(unittest.TestCase):
                     init_steps=0, goal_behavior=0, goal_target_distance=30., max_controlled_agents=32,
                     map_ids=[0],
                 )
+
+    def test_wosac_retains_prediction_targets_beyond_actor_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            limit = self.binding.MAX_AGENTS
+            targets = (0, 1, 2, limit + 1, limit + 3)
+            write_fixture_map(Path(directory) / "map_000.bin", 0, limit + 5,
+                              tracks=targets, goal_distance=100.)
+            for mode, count in ((2, limit), (1, limit), (3, 1)):
+                with self.subTest(control_mode=mode):
+                    offsets, _, _ = self.binding.shared(
+                        map_dir=directory, num_agents=1, num_maps=1, init_mode=0,
+                        control_mode=mode, init_steps=10, goal_behavior=2,
+                        goal_target_distance=30., max_controlled_agents=limit, map_ids=[0])
+                    self.assertEqual(offsets, [0, count])
+                    env = NativeDriveHarness(self.binding, directory, init_steps=10,
+                                             num_agents=count, control_mode=mode)
+                    try:
+                        env.reset()
+                        truth = env.get_ground_truth_trajectories()
+                        ids = truth["id"][:, 0].tolist()
+                        self.assertEqual(ids[0], 0)  # Original SDC stays first.
+                        self.assertEqual(len(set(ids)), count)
+                        if mode == 2:
+                            loaded = truth["id"][truth["is_track_to_predict"]].tolist()
+                            self.assertEqual(set(loaded), set(targets))
+                        else:
+                            self.assertEqual(ids, list(range(count)))
+                    finally:
+                        env.close()
 
     def test_real_scene_logs_export_completion_metrics(self):
         import numpy as np
@@ -857,7 +904,7 @@ class NativeDriveHarness:
     """Minimal adapter around the real C simulator for CPU trajectory tests."""
 
     def __init__(self, binding, directory, init_steps, episode_length=91, goal_radius=2.,
-                 goal_behavior=2):
+                 goal_behavior=2, num_agents=2, control_mode=2):
         import numpy as np
 
         self.binding = binding
@@ -865,18 +912,19 @@ class NativeDriveHarness:
         self.defer_reset = True
         self.init_steps = init_steps
         self.steps = 0
+        self.num_agents = num_agents
         obs_size = binding.EGO_FEATURES_CLASSIC + (binding.MAX_AGENTS - 1) * 7 + 128 * 7
-        self.obs = np.zeros((2, obs_size), dtype=np.float32)
-        self.actions = np.full((2, 1), 45, dtype=np.int32)
-        self.rewards = np.zeros(2, dtype=np.float32)
-        self.terminals = np.zeros(2, dtype=bool)
-        self.truncations = np.zeros(2, dtype=bool)
+        self.obs = np.zeros((num_agents, obs_size), dtype=np.float32)
+        self.actions = np.full((num_agents, 1), 45, dtype=np.int32)
+        self.rewards = np.zeros(num_agents, dtype=np.float32)
+        self.terminals = np.zeros(num_agents, dtype=bool)
+        self.truncations = np.zeros(num_agents, dtype=bool)
         self.observation_space = SimpleNamespace(shape=self.obs.shape)
         self.action_space = SimpleNamespace(shape=self.actions.shape)
         kwargs = evaluation.load_settings(ROOT / "pufferlib/config/ocean/drive.ini")["env"]
-        kwargs.update(map_dir=directory, map_id=0, max_agents=2, human_agent_idx=0,
+        kwargs.update(map_dir=directory, map_id=0, max_agents=num_agents, human_agent_idx=0,
                       ini_file=str(ROOT / "pufferlib/config/ocean/drive.ini"),
-                      action_type=0, dynamics_model=0, control_mode=2, init_mode=0,
+                      action_type=0, dynamics_model=0, control_mode=control_mode, init_mode=0,
                       init_steps=init_steps, episode_length=episode_length, termination_mode=0,
                       goal_behavior=goal_behavior, goal_radius=goal_radius, defer_reset=True)
         self.handle = binding.env_init(self.obs, self.actions, self.rewards, self.terminals,
@@ -885,7 +933,7 @@ class NativeDriveHarness:
 
     def reset(self):
         self.binding.vec_reset(self.vec, 42)
-        self.binding.vec_log(self.vec, 2)
+        self.binding.vec_log(self.vec, self.num_agents)
         return self.obs, []
 
     def step(self, actions):
@@ -899,7 +947,7 @@ class NativeDriveHarness:
     def get_global_agent_state(self):
         import numpy as np
 
-        state = {key: np.zeros(2, dtype=np.int32 if key == "id" else np.float32)
+        state = {key: np.zeros(self.num_agents, dtype=np.int32 if key == "id" else np.float32)
                  for key in ("x", "y", "z", "heading", "id", "length", "width")}
         self.binding.vec_get_global_agent_state(self.vec, *state.values())
         return state
@@ -907,11 +955,12 @@ class NativeDriveHarness:
     def get_ground_truth_trajectories(self):
         import numpy as np
 
-        truth = {key: np.zeros((2, 91 - self.init_steps), dtype=np.float32)
+        n = self.num_agents
+        truth = {key: np.zeros((n, 91 - self.init_steps), dtype=np.float32)
                  for key in ("x", "y", "z", "heading")}
-        truth.update(valid=np.zeros((2, 91 - self.init_steps), dtype=np.int32),
-                     id=np.zeros(2, dtype=np.int32), is_vehicle=np.zeros(2, dtype=bool),
-                     is_track_to_predict=np.zeros(2, dtype=bool), scenario_id=np.zeros(2, dtype="S16"))
+        truth.update(valid=np.zeros((n, 91 - self.init_steps), dtype=np.int32),
+                     id=np.zeros(n, dtype=np.int32), is_vehicle=np.zeros(n, dtype=bool),
+                     is_track_to_predict=np.zeros(n, dtype=bool), scenario_id=np.zeros(n, dtype="S16"))
         self.binding.vec_get_global_ground_truth_trajectories(self.vec, *truth.values())
         truth["scenario_id"] = truth["scenario_id"].astype(str)
         return {key: value[:, None] for key, value in truth.items()}

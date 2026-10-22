@@ -1256,6 +1256,18 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     return;
 }
 
+static inline int is_in_track_to_predicts(Drive *env, int agent_idx) {
+    if (env->tracks_to_predict_indices == NULL || env->num_tracks_to_predict == 0) {
+        return 0;
+    }
+    for (int k = 0; k < env->num_tracks_to_predict; k++) {
+        if (env->tracks_to_predict_indices[k] == agent_idx) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 bool should_control_agent(Drive *env, int agent_idx, int control_limit) {
     // Check if we have room for more agents or are already at capacity
     if (env->active_agent_count >= control_limit) {
@@ -1338,53 +1350,59 @@ void set_active_agents(Drive *env) {
         env->entities[sdc_index].active_agent = 1;
     }
 
-    // Iterate through entities to find agents to create and/or control
-    for (int i = 0; i < env->num_objects && env->num_actors < MAX_AGENTS; i++) {
+    // Reserve WOSAC capacity for prediction targets before filling with other
+    // actors. Otherwise early non-targets can crowd out targets beyond index 31.
+    int passes = env->control_mode == CONTROL_WOSAC ? 2 : 1;
+    for (int pass = 0; pass < passes; pass++) {
+        for (int i = 0; i < env->num_objects && env->num_actors < MAX_AGENTS; i++) {
+            if (env->control_mode == CONTROL_WOSAC &&
+                is_in_track_to_predicts(env, i) != (pass == 0)) {
+                continue;
+            }
 
-        // Skip if its the SDC
-        if (i == sdc_index) {
-            continue;
-        }
+            // The original SDC has already been created.
+            if (i == sdc_index) {
+                continue;
+            }
 
-        Entity *entity = &env->entities[i];
+            Entity *entity = &env->entities[i];
 
-        // Skip if not valid at initialization
-        if (entity->traj_valid[env->init_steps] != 1) {
-            continue;
-        }
+            // Skip if not valid at initialization
+            if (entity->traj_valid[env->init_steps] != 1) {
+                continue;
+            }
 
-        // Determine if entity should be created
-        bool should_create = false;
-        if (env->init_mode == INIT_ALL_VALID) {
-            should_create = true; // All valid entities
-        } else if (env->control_mode == CONTROL_VEHICLES) {
-            should_create = (entity->type == VEHICLE);
-        } else { // Control all agents
-            should_create = (entity->type == VEHICLE || entity->type == PEDESTRIAN || entity->type == CYCLIST);
-        }
+            // Determine if entity should be created
+            bool should_create = false;
+            if (env->init_mode == INIT_ALL_VALID) {
+                should_create = true; // All valid entities
+            } else if (env->control_mode == CONTROL_VEHICLES) {
+                should_create = (entity->type == VEHICLE);
+            } else { // Control all agents
+                should_create = (entity->type == VEHICLE || entity->type == PEDESTRIAN || entity->type == CYCLIST);
+            }
 
-        if (!should_create)
-            continue;
+            if (!should_create)
+                continue;
 
-        env->num_actors++;
+            env->num_actors++;
 
-        // Determine if this agent should be policy-controlled
-        bool is_controlled = false;
+            // Determine if this agent should be policy-controlled
+            bool is_controlled = should_control_agent(env, i, control_limit);
 
-        is_controlled = should_control_agent(env, i, control_limit);
-
-        if (is_controlled) {
-            active_agent_indices[env->active_agent_count] = i;
-            env->active_agent_count++;
-            env->entities[i].active_agent = 1;
-        } else if (env->init_mode != INIT_ONLY_CONTROLLABLE_AGENTS) {
-            static_agent_indices[env->static_agent_count] = i;
-            env->static_agent_count++; // Includes expert replay and static agents
-            env->entities[i].active_agent = 0;
-            if (env->entities[i].mark_as_expert == 1 || env->active_agent_count == control_limit) {
-                expert_static_agent_indices[env->expert_static_agent_count] = i;
-                env->expert_static_agent_count++;
-                env->entities[i].mark_as_expert = 1;
+            if (is_controlled) {
+                active_agent_indices[env->active_agent_count] = i;
+                env->active_agent_count++;
+                env->entities[i].active_agent = 1;
+            } else if (env->init_mode != INIT_ONLY_CONTROLLABLE_AGENTS) {
+                static_agent_indices[env->static_agent_count] = i;
+                env->static_agent_count++; // Includes expert replay and static agents
+                env->entities[i].active_agent = 0;
+                if (env->entities[i].mark_as_expert == 1 || env->active_agent_count == control_limit) {
+                    expert_static_agent_indices[env->expert_static_agent_count] = i;
+                    env->expert_static_agent_count++;
+                    env->entities[i].mark_as_expert = 1;
+                }
             }
         }
     }
@@ -1734,18 +1752,6 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
     }
 
     return;
-}
-
-static inline int is_in_track_to_predicts(Drive *env, int agent_idx) {
-    if (env->tracks_to_predict_indices == NULL || env->num_tracks_to_predict == 0) {
-        return 0;
-    }
-    for (int k = 0; k < env->num_tracks_to_predict; k++) {
-        if (env->tracks_to_predict_indices[k] == agent_idx) {
-            return 1;
-        }
-    }
-    return 0;
 }
 
 void c_get_global_agent_state(Drive *env, float *x_out, float *y_out, float *z_out, float *heading_out, int *id_out,

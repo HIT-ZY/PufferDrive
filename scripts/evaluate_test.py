@@ -19,7 +19,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TEST_DIR = Path("resources/drive/binaries/testing")
-DEFAULT_OUTPUT_DIR = Path("/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results")
+DEFAULT_OUTPUT_DIR = Path("/mnt/cpfs-wlc-rdma-300t/mnt/cpfs-wlc-rdma-300t/results")
 DEFAULT_SANITY_DIR = Path("resources/drive/sanity/sanity_jsons")
 SANITY_MAPS = (
     "forward_goal_in_front", "reverse_goal_behind", "two_agent_forward_goal_in_front",
@@ -257,6 +257,10 @@ def prepare_sanity_maps(options, destination):
         scene = json.loads(source.read_text())
         # Curated JSONs may share or omit IDs. Give each temporary scene a unique short ID.
         scene["scenario_id"] = f"sanity_{index:03d}"
+        # Handcrafted maps can retain indices from a larger source scene. This
+        # stage controls eligible actors, so neither Waymo role is needed here.
+        scene["metadata"] = {**scene.get("metadata", {}),
+                             "sdc_track_index": -1, "tracks_to_predict": []}
         save_map_binary(scene, destination / f"map_{index:03d}.bin", index)
     ids, _, _ = validate_stage_maps(destination, len(names), "sanity")
     return ids, names

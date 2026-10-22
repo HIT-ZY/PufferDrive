@@ -38,10 +38,10 @@ state is not reset separately on an individual agent respawn.
 | `--batch-size` | `8` complete scenes |
 | `--device` | `cuda:0` |
 | `--seed` | `42` |
-| `--output-dir` | `/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/results` |
+| `--output-dir` | `/mnt/cpfs-wlc-rdma-300t/mnt/cpfs-wlc-rdma-300t/results` |
 
 The current resource link points to
-`/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/pufferdrive_womd_1k/resources`.
+`/mnt/cpfs-wlc-rdma-300t/mnt/cpfs-wlc-rdma-300t/pufferdrive_womd_1k/resources`.
 Check the server with `readlink -f resources`. Switching the entire resource
 link also changes where sanity JSONs are found. If the new directory contains
 only BIN data, restore `drive/sanity/sanity_jsons`, or pass `--sanity-dir` with
@@ -50,8 +50,11 @@ stage; the subsequent stages still run. The script does not substitute invented
 maps for missing resources.
 
 Sanity JSONs are converted with the existing `save_map_binary` function into a
-temporary directory with unique scene IDs. Original JSONs and BIN files are not
-modified. Each basic map receives a separate summary. `solved` means its mean
+temporary directory with unique scene IDs. The temporary sanity scenes omit
+Waymo SDC/prediction indices, which may be stale after handcrafted map editing
+and are not used by this stage. Original JSONs and BIN files are not modified;
+the real test dataset retains its original metadata and strict index checks.
+Each basic map receives a separate summary. `solved` means its mean
 `score >= 0.95` after all requested rollouts; this is not the strict safe-completion
 criterion. A low score is a valid evaluation result, not an execution failure.
 Unlike `puffer sanity`, this stage **does not train a new model on each map**.
@@ -118,6 +121,12 @@ WOSAC uses `wosac_*` settings: by default frame 10 initialization,
 81 states through frame 90 using 80 actions (8 simulated seconds at `dt=0.1`).
 `defer_reset=True` keeps the final frame intact. Only original `tracks_to_predict`
 objects are scored, though other simulated participants affect interactions.
+Within the simulator's actor capacity (default: 32), WOSAC loads the original SDC
+first, then valid prediction targets, then other valid actors in object order.
+This keeps targets late in the object list from being displaced by non-targets.
+The script still requires every prediction target to be loaded; if the targets
+and SDC themselves exceed capacity, it reports a coverage error. This capacity
+also limits the background traffic represented in the realism evaluation.
 This is the project's implementation with its local `wosac.ini` weights, not a
 submission to an external benchmark server.
 
