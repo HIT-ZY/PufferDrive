@@ -56,6 +56,62 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(evaluation.aggregate_wosac(rows)["total_num_agents"], 21)
         self.assertEqual(evaluation.aggregate_wosac(rows[:1])["realism_meta_score_std"], 0)
 
+    def test_wosac_averages_each_metric_over_applicable_scenes(self):
+        complete = evaluation.prepare_wosac_row({key: 0.2 for key in evaluation.WOSAC_METRICS}, True)
+        partial = evaluation.prepare_wosac_row({key: 0.8 for key in evaluation.WOSAC_METRICS}, False)
+        result = evaluation.aggregate_wosac([complete, partial])
+        counts = evaluation.wosac_metric_coverage([complete, partial])
+        self.assertEqual(result["realism_meta_score"], 0.2)
+        self.assertEqual(result["realism_meta_score_std"], 0.)
+        self.assertEqual(result["ade"], 0.5)
+        self.assertEqual(counts["realism_meta_score"], 1)
+        self.assertEqual(counts["likelihood_time_to_collision"], 1)
+        self.assertEqual(counts["ade"], 2)
+        self.assertEqual(result["total_unique_scenarios"], 2)
+        all_partial = evaluation.aggregate_wosac([partial])
+        self.assertIsNone(all_partial["realism_meta_score"])
+        self.assertIsNone(all_partial["realism_meta_score_std"])
+        self.assertEqual(all_partial["ade"], 0.8)
+        json.dumps(all_partial, allow_nan=False)
+
+    def test_wosac_applicability_does_not_hide_invalid_metrics(self):
+        raw = {key: 0.5 for key in evaluation.WOSAC_METRICS}
+        raw["likelihood_time_to_collision"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "non-finite metric likelihood_time_to_collision"):
+            evaluation.prepare_wosac_row(raw, True)
+        with self.assertRaisesRegex(ValueError, "non-finite metric likelihood_time_to_collision"):
+            evaluation.aggregate_wosac([raw])
+        raw["ade"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "non-finite metric ade"):
+            evaluation.prepare_wosac_row(raw, False)
+
+    def test_all_nonvehicle_wosac_run_saves_nulls_and_completes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model.pt").touch()
+            write_fixture_map(root / "map_000.bin", 0, 2, tracks=(1,))
+
+            def fake_stage(options, config, ids, report, mode, *args):
+                row = evaluation.prepare_wosac_row({key: 0.5 for key in evaluation.WOSAC_METRICS}, False)
+                row["num_agents_per_scene"] = 1
+                report["per_scene"][mode].append({"map_id": 0, "scenario_id": ids[0], **row})
+
+            output = io.StringIO()
+            with patch.object(evaluation, "run_stage", side_effect=fake_stage), \
+                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                code = evaluation.main([
+                    "--checkpoint", str(root / "model.pt"), "--test-dir", str(root),
+                    "--output-dir", str(root / "out"), "--num-maps", "1", "--stages", "wosac"])
+            self.assertEqual(code, 0)
+            report = json.loads(next((root / "out").glob("*.json")).read_text())
+            self.assertEqual(report["status"], "complete")
+            self.assertEqual(report["stages"]["wosac"]["coverage"], 1)
+            self.assertIsNone(report["metrics"]["wosac"]["realism_meta_score"])
+            self.assertEqual(report["metric_coverage"]["wosac"]["realism_meta_score"], 0)
+            self.assertEqual(report["metric_coverage"]["wosac"]["ade"], 1)
+            self.assertIn("N/A (0/1 scenes)", output.getvalue())
+            self.assertIn("likelihood_time_to_collision", report["per_scene"]["wosac"][0]["not_applicable"])
+
     def test_map_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -121,7 +177,13 @@ class EvaluationTests(unittest.TestCase):
     def test_missing_wosac_target_is_reported_and_replay_continues(self):
         self.check_passes(missing_target=True)
 
-    def check_passes(self, bad_tracks=False, missing_target=False):
+    def test_nonvehicle_scene_keeps_other_scenes_and_later_batches(self):
+        self.check_passes(nonvehicle_scenes=("scene_1",))
+
+    def test_all_nonvehicle_scenes_still_complete_every_stage(self):
+        self.check_passes(nonvehicle_scenes=("scene_0", "scene_1", "scene_2"))
+
+    def check_passes(self, bad_tracks=False, missing_target=False, nonvehicle_scenes=()):
         import numpy as np
 
         with tempfile.TemporaryDirectory() as directory:
@@ -186,8 +248,10 @@ class EvaluationTests(unittest.TestCase):
                     return len(self.index)
 
                 def __getitem__(self, key):
-                    return SimpleNamespace(to_dict=lambda: {
-                        **{name: 0.5 for name in evaluation.WOSAC_METRICS}, "num_agents_per_scene": 2})
+                    row = {**{name: 0.5 for name in evaluation.WOSAC_METRICS}, "num_agents_per_scene": 2}
+                    if key in nonvehicle_scenes:
+                        row.update({name: np.nan for name in evaluation.WOSAC_TTC_DEPENDENT})
+                    return SimpleNamespace(to_dict=lambda: row)
 
             class FakeWosac:
                 def __init__(self, config):
@@ -197,6 +261,8 @@ class EvaluationTests(unittest.TestCase):
                     count = 1 if missing_target else 2
                     return {"scenario_id": np.array([[s] for s in env.scenario_ids for _ in range(count)]),
                             "id": np.array([[i] for _ in env.scenario_ids for i in range(count)]),
+                            "is_vehicle": np.array([[s not in nonvehicle_scenes]
+                                                    for s in env.scenario_ids for _ in range(count)]),
                             "is_track_to_predict": np.ones((len(env.scenario_ids) * count, 1), dtype=bool)}
 
                 def collect_simulated_trajectories(self, config, env, policy):
@@ -205,6 +271,7 @@ class EvaluationTests(unittest.TestCase):
                 def compute_metrics(self, truth, *args, **kwargs):
                     self_test.assertFalse(kwargs["drop_last_scenario"])
                     self_test.assertFalse(kwargs["round_results"])
+                    self_test.assertTrue(kwargs["allow_undefined_ttc"])
                     return FakeResults(list(dict.fromkeys(truth["scenario_id"][:, 0])))
 
             modules = {
@@ -246,6 +313,16 @@ class EvaluationTests(unittest.TestCase):
                 self.assertEqual(len(report["per_scene"]["wosac"]), 3)
                 self.assertEqual(report["metrics"]["wosac"]["total_num_agents"], 6)
                 self.assertEqual(loads, ["control_agents", "control_agents", "control_wosac", "control_sdc_only"])
+                self.assertEqual(report["metric_coverage"]["wosac"]["ade"], 3)
+                self.assertEqual(report["metric_coverage"]["wosac"]["realism_meta_score"],
+                                 3 - len(nonvehicle_scenes))
+                for row in report["per_scene"]["wosac"]:
+                    if row["scenario_id"] in nonvehicle_scenes:
+                        for key in evaluation.WOSAC_TTC_DEPENDENT:
+                            self.assertIsNone(row[key])
+                            self.assertIn(key, row["not_applicable"])
+                    self.assertEqual(row["ade"], 0.5)
+                json.dumps(report, allow_nan=False)
             for mode, keys in evaluation.METRIC_GROUPS.items():
                 self.assertEqual(set(report["metrics"][mode]), set(keys))
 
@@ -441,10 +518,10 @@ class WosacInputValidationTests(unittest.TestCase):
         self.edges = {"x": np.array([-200., 200.]), "y": np.array([-10., -10.]),
                       "lengths": np.array([2]), "scenario_id": np.array(["scene_0"])}
 
-    def compute(self, benchmark):
+    def compute(self, benchmark, **kwargs):
         evaluator = benchmark.WOSACEvaluator({"train": {"device": "cpu"}, "eval": {"wosac_init_steps": 10}})
         return evaluator.compute_metrics(self.truth, self.sim, self.state, self.edges,
-                                         drop_last_scenario=False, round_results=False)
+                                         drop_last_scenario=False, round_results=False, **kwargs)
 
     def test_nonfinite_simulation_cannot_be_hidden_by_scene_averaging(self):
         import numpy as np
@@ -496,6 +573,48 @@ class WosacInputValidationTests(unittest.TestCase):
         with benchmark_module() as benchmark:
             with self.assertRaisesRegex(ValueError, "likelihood_time_to_collision.*scene_0.*vehicle"):
                 self.compute(benchmark)
+
+    def test_wosac_keeps_other_metrics_when_ttc_is_not_applicable(self):
+        import numpy as np
+
+        # A vehicle outside tracks_to_predict must not make TTC applicable.
+        self.truth["is_track_to_predict"][0] = False
+        self.truth["is_vehicle"][1] = False
+        with benchmark_module() as benchmark:
+            result = self.compute(benchmark, allow_undefined_ttc=True)
+        self.assertEqual(list(result.index), ["scene_0"])
+        raw = result.loc["scene_0"].to_dict()
+        for key in evaluation.WOSAC_TTC_DEPENDENT:
+            self.assertTrue(np.isnan(raw[key]), key)
+        row = evaluation.prepare_wosac_row(raw, False)
+        self.assertEqual(row["ade"], 0.)
+        self.assertEqual(row["num_agents_per_scene"], 1)
+        self.assertGreater(row["kinematic_metrics"], 0.)
+        json.dumps(row, allow_nan=False)
+
+    def test_wosac_mixed_scene_batch_retains_applicability(self):
+        import numpy as np
+
+        self.truth["scenario_id"][1] = "scene_1"
+        self.truth["is_vehicle"][1] = False
+        self.edges = {"x": np.tile(self.edges["x"], 2), "y": np.tile(self.edges["y"], 2),
+                      "lengths": np.array([2, 2]), "scenario_id": np.array(["scene_0", "scene_1"])}
+        with benchmark_module() as benchmark:
+            result = self.compute(benchmark, allow_undefined_ttc=True)
+        self.assertEqual(list(result.index), ["scene_0", "scene_1"])
+        complete = evaluation.prepare_wosac_row(result.loc["scene_0"].to_dict(), True)
+        partial = evaluation.prepare_wosac_row(result.loc["scene_1"].to_dict(), False)
+        summary = evaluation.aggregate_wosac([complete, partial])
+        self.assertEqual(summary["realism_meta_score"], complete["realism_meta_score"])
+        self.assertEqual(summary["ade"], 0.)
+        self.assertEqual(summary["total_num_agents"], 2)
+
+    def test_allowing_undefined_ttc_does_not_hide_other_undefined_metrics(self):
+        # One reference frame cannot define speed or acceleration.
+        self.truth["valid"][:, :, 1:] = False
+        with benchmark_module() as benchmark:
+            with self.assertRaisesRegex(ValueError, "Undefined WOSAC metric likelihood_linear_speed"):
+                self.compute(benchmark, allow_undefined_ttc=True)
 
     def test_wosac_mixed_targets_exclude_nonvehicles_only_from_ttc(self):
         self.truth["is_vehicle"][1] = False

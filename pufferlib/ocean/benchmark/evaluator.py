@@ -280,6 +280,7 @@ class WOSACEvaluator:
         aggregate_results: bool = False,
         drop_last_scenario: bool = True,
         round_results: bool = True,
+        allow_undefined_ttc: bool = False,
     ) -> Dict:
         """Compute realism metrics comparing simulated and ground truth trajectories.
 
@@ -291,6 +292,9 @@ class WOSACEvaluator:
             drop_last_scenario: Drop the potentially partial scene in random agent-budget batches.
                 Set False only when all selected scenes were loaded in full.
             round_results: Round scene metrics for display; disable for dataset aggregation.
+            allow_undefined_ttc: Keep scenes without vehicle prediction targets. Their TTC,
+                interactive score and meta score remain NaN; callers must report applicability
+                and valid-scene counts when aggregating these results.
 
         Note: z-position currently not used.
 
@@ -628,9 +632,13 @@ class WOSACEvaluator:
 
         # A scene with no eligible samples for a feature has no defined score.
         # Dropping the row here silently loses its other, valid metrics as well.
-        missing = df_scene_level.isna().to_numpy()
-        if missing.any():
-            row, column = np.argwhere(missing)[0]
+        missing = df_scene_level.isna()
+        if allow_undefined_ttc:
+            vehicle_scenes = eval_scenario_ids[eval_is_vehicle.astype(bool)].ravel()
+            no_vehicle = ~df_scene_level.index.isin(vehicle_scenes)
+            missing.loc[no_vehicle, "likelihood_time_to_collision"] = False
+        if missing.to_numpy().any():
+            row, column = np.argwhere(missing.to_numpy())[0]
             metric = df_scene_level.columns[column]
             reason = ("TTC requires a vehicle among the prediction targets."
                       if metric == "likelihood_time_to_collision"

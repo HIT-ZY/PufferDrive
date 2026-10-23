@@ -131,9 +131,26 @@ This is the project's implementation with its local `wosac.ini` weights, not a
 submission to an external benchmark server.
 
 TTC is scored only for vehicle prediction targets. A scene whose prediction
-targets are all pedestrians/cyclists has no defined TTC score. Evaluation reports
-the scene ID and undefined metric as an error; it does not discard the scene or
-substitute a score. Other stages can still run independently.
+targets are all pedestrians/cyclists has no defined TTC score. The four-stage
+script retains this scene and continues to later batches. Its TTC,
+`interactive_metrics`, and `realism_meta_score` are JSON `null` with explanations
+in the per-scene `not_applicable` field. All other computable metrics are retained.
+No zero/one score is substituted and the composite weights are not renormalized.
+
+Each metric is averaged only over scenes where it is applicable. In particular,
+the composite uses only scenes with all required metrics, while ADE and other
+available metrics include nonvehicle-only scenes. `metric_coverage.wosac` records
+the valid-scene count for each metric, also printed as `(valid/processed scenes)`.
+For example, `realism_meta_score ... (980/1000 scenes)` is a score for 980 scenes,
+even though all 1000 were evaluated. If no scene supports a metric, its summary
+is `null` (`N/A` in the terminal), including the composite standard deviation.
+An otherwise successful run is `complete` once all scenes have been processed.
+Report schema version 5 introduces these applicability and coverage fields.
+
+This exception applies only to absent vehicle prediction targets. Invalid
+trajectories, missing targets, and undefined metrics for other reasons still
+produce an error. The shared evaluator retains strict behavior unless its caller
+explicitly enables `allow_undefined_ttc` and handles the missing scores.
 
 | Metric | Meaning |
 | --- | --- |
@@ -155,9 +172,9 @@ substitute a score. Other stages can still run independently.
 | `num_collisions_sim` / `num_collisions_ref` | Simulated/reference any-collision fractions; despite their names, these are not event counts. |
 | `num_offroad_sim` / `num_offroad_ref` | Simulated/reference any-offroad fractions. |
 | `num_agents_per_scene` | Mean number of scored objects per scene; per-scene rows retain the individual counts. |
-| `realism_meta_score_std` | Population standard deviation over scene scores, zero for one scene. |
+| `realism_meta_score_std` | Population standard deviation over applicable scene scores; zero for one scene and null for none. |
 | `total_num_agents` | Scored objects summed across scenes, not multiplied by rollout count. |
-| `total_unique_scenarios` | Number of scored scenes. |
+| `total_unique_scenarios` | Number of processed scenes, including those where TTC and composite scores are not applicable. |
 
 `likelihood_*` are exponentiated log-likelihood scores, higher is better.
 ADE/minADE are not part of the composite. The current implementation does not

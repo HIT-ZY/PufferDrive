@@ -48,6 +48,9 @@ WOSAC_METRICS = (
     "num_agents_per_scene",
 )
 WOSAC_TOTALS = ("realism_meta_score_std", "total_num_agents", "total_unique_scenarios")
+# Without vehicle prediction targets, TTC and the scores requiring it are undefined.
+WOSAC_TTC_DEPENDENT = ("likelihood_time_to_collision", "interactive_metrics", "realism_meta_score")
+WOSAC_NO_VEHICLE_REASON = "No vehicle among the original prediction targets; TTC is not applicable."
 METRIC_GROUPS = {
     "sanity": (*DRIVING_METRICS, *DRIVING_TOTALS, "solved_maps", "evaluated_maps", "solved_rate"),
     "self_play": (*DRIVING_METRICS, *DRIVING_TOTALS),
@@ -284,16 +287,38 @@ def aggregate_driving(rows):
 def aggregate_wosac(rows):
     if not rows:
         raise ValueError("No WOSAC scene results")
-    result = {key: sum(row[key] for row in rows) / len(rows) for key in WOSAC_METRICS}
-    result.update(realism_meta_score_std=statistics.pstdev(row["realism_meta_score"] for row in rows),
+    for row in rows:
+        check_metrics(row, WOSAC_METRICS, allow_none=WOSAC_TTC_DEPENDENT)
+    values = {key: [row[key] for row in rows if row[key] is not None] for key in WOSAC_METRICS}
+    result = {key: sum(items) / len(items) if items else None for key, items in values.items()}
+    scores = values["realism_meta_score"]
+    result.update(realism_meta_score_std=statistics.pstdev(scores) if scores else None,
                   total_num_agents=sum(row["num_agents_per_scene"] for row in rows),
                   total_unique_scenarios=len(rows))
     return result
 
 
-def check_metrics(row, keys):
+def wosac_metric_coverage(rows):
+    counts = {key: sum(row[key] is not None for row in rows) for key in WOSAC_METRICS}
+    counts["realism_meta_score_std"] = counts["realism_meta_score"]
+    return counts
+
+
+def prepare_wosac_row(raw, has_vehicle_targets):
+    """Convert only the known no-vehicle TTC case to JSON null, with its reason."""
+    not_applicable = {} if has_vehicle_targets else {
+        key: WOSAC_NO_VEHICLE_REASON for key in WOSAC_TTC_DEPENDENT}
+    row = {key: None if key in not_applicable else float(raw[key]) for key in WOSAC_METRICS}
+    check_metrics(row, WOSAC_METRICS, allow_none=not_applicable)
+    row["not_applicable"] = not_applicable
+    return row
+
+
+def check_metrics(row, keys, allow_none=()):
     for key in keys:
-        if key not in row or not math.isfinite(float(row[key])):
+        if key in row and row[key] is None and key in allow_none:
+            continue
+        if key not in row or row[key] is None or not math.isfinite(float(row[key])):
             raise ValueError(f"Missing or non-finite metric {key}: {row}")
 
 
@@ -398,6 +423,7 @@ def run_stage(options, config, scenario_ids, report, mode, map_names=None, targe
                 env.reset(seed=options.seed + start)
                 truth = evaluator.collect_ground_truth_trajectories(env)
                 # Do not silently score only a subset when a target was not created by C.
+                has_vehicle_targets = {}
                 for scene_id in expected_ids:
                     mask = ((truth["scenario_id"][:, 0] == scene_id)
                             & truth["is_track_to_predict"][:, 0])
@@ -405,22 +431,23 @@ def run_stage(options, config, scenario_ids, report, mode, map_names=None, targe
                     if actual_ids != set(targets[scene_id]):
                         raise RuntimeError(f"WOSAC target coverage mismatch in {scene_id}: "
                                            f"expected={targets[scene_id]}, loaded={sorted(actual_ids)}")
+                    has_vehicle_targets[scene_id] = bool(truth["is_vehicle"][mask].any())
                 trajectories = evaluator.collect_simulated_trajectories(stage_config, env, policy)
                 results = evaluator.compute_metrics(
                     truth, trajectories, env.get_global_agent_state(), env.get_road_edge_polylines(),
                     aggregate_results=False, drop_last_scenario=False, round_results=False,
+                    allow_undefined_ttc=True,
                 )
                 if set(results.index) != set(expected_ids) or len(results) != len(indices):
                     missing = sorted(set(expected_ids) - set(results.index))
                     raise RuntimeError(f"Incomplete WOSAC results; missing scenarios: {missing}")
                 for map_id, scene_id in zip(indices, expected_ids):
-                    row = results.loc[scene_id].to_dict()
-                    check_metrics(row, WOSAC_METRICS)
+                    row = prepare_wosac_row(results.loc[scene_id].to_dict(), has_vehicle_targets[scene_id])
                     if row["num_agents_per_scene"] != len(targets[scene_id]):
                         raise RuntimeError(f"Incomplete WOSAC target count in {scene_id}")
-                    rows.append({"map_id": map_id, "scenario_id": scene_id,
-                                 **{key: float(value) for key, value in row.items()}})
+                    rows.append({"map_id": map_id, "scenario_id": scene_id, **row})
                 report["metrics"][mode] = aggregate_wosac(rows)
+                report["metric_coverage"][mode] = wosac_metric_coverage(rows)
             else:
                 rollouts = options.sanity_rollouts if mode == "sanity" else options.driving_rollouts
                 for rollout in range(rollouts):
@@ -517,8 +544,11 @@ def evaluate(options, config, report):
         if rows:
             try:
                 summary = aggregate_wosac(rows) if mode == "wosac" else aggregate_driving(rows)
-                check_metrics(summary, WOSAC_METRICS if mode == "wosac" else DRIVING_METRICS)
+                check_metrics(summary, WOSAC_METRICS if mode == "wosac" else DRIVING_METRICS,
+                              allow_none=WOSAC_TTC_DEPENDENT if mode == "wosac" else ())
                 report["metrics"][mode] = summary
+                if mode == "wosac":
+                    report["metric_coverage"][mode] = wosac_metric_coverage(rows)
                 if mode == "sanity":
                     summarize_sanity(report, options.sanity_rollouts)
             except Exception as exc:
@@ -560,13 +590,14 @@ def new_report(options):
                         "requested_scenarios": len(options.sanity_maps) if mode == "sanity" else options.num_maps,
                         "coverage": 0}
     return {
-        "schema_version": 4, "replay_ego": "sdc",
+        "schema_version": 5, "replay_ego": "sdc",
         "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(options.checkpoint), "test_dir": str(options.test_dir),
         "sanity_dir": str(options.sanity_dir), "sanity_maps": options.sanity_maps,
         "config": str(options.config), "requested_scenarios": options.num_maps,
         "stage_order": list(groups), "stages": stages,
         "metrics": {mode: {key: None for key in keys} for mode, keys in groups.items()},
+        "metric_coverage": {"wosac": wosac_metric_coverage([])},
         "per_scene": {mode: [] for mode in groups}, "sanity_results": [],
         "skipped": {mode: "Not selected by --stages" for mode, stage in stages.items()
                     if stage["status"] == "skipped"},
@@ -585,6 +616,11 @@ def new_report(options):
             "sanity": "Inference only; solved if per-map mean score >= 0.95 after all requested rollouts.",
             "wosac": "Project WOSAC implementation with local wosac.ini weights; original prediction targets only. "
                      "ADE/minADE are in metres and excluded from realism_meta_score. likelihood_* are exponentiated log-likelihood scores.",
+            "wosac_not_applicable": "Scenes without vehicle prediction targets retain all other metrics. TTC, "
+                                    "interactive_metrics and realism_meta_score are null with a per-scene reason. "
+                                    "Summaries average each metric over its applicable scenes; original composite "
+                                    "weights are unchanged. metric_coverage lists each metric's valid-scene count. "
+                                    "Stage coverage counts processed scenes, including those with not-applicable metrics.",
             "num_collisions_sim": "Scene mean per-agent probability of any collision over simulated rollouts (not an event count).",
             "num_collisions_ref": "Scene fraction of reference agents with any collision.",
             "num_offroad_sim": "Scene mean per-agent probability of any offroad event over simulated rollouts.",
@@ -606,7 +642,11 @@ def print_report(report, path):
             print(f"  {report['skipped'][mode]}")
             continue
         for key, value in metrics.items():
-            print(f"  {key:38s}: {value:.6f}" if value is not None else f"  {key:38s}: unavailable")
+            coverage = report["metric_coverage"].get(mode, {})
+            display = f"{value:.6f}" if value is not None else (
+                "N/A" if key in coverage and stage["coverage"] > 0 else "unavailable")
+            suffix = f" ({coverage[key]}/{stage['coverage']} scenes)" if key in coverage else ""
+            print(f"  {key:38s}: {display}{suffix}")
         if mode == "sanity":
             for item in report["sanity_results"]:
                 result = "incomplete" if item["solved"] is None else "solved" if item["solved"] else "unsolved"
