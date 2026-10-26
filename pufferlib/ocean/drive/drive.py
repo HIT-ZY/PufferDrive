@@ -758,7 +758,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Convert driving scene JSON files to map binaries.")
-    parser.add_argument("--data-folder", default="/mnt/cpfs-c-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/training",
+    parser.add_argument("--data-folder", default="/mnt/cpfs-wlc-rdma-300t/mnt/cpfs-wlc-rdma-300t/GPUDrive_mini/training",
                         help="Input directory containing JSON scenes")
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: resources/drive/binaries/<input directory name>)")
