@@ -77,6 +77,21 @@ Selected stages always follow the four-stage order, regardless of argument order
 Use `--config /path/to/drive.ini` if the checkpoint uses different architecture,
 action-space or reward settings. This config is merged over `config/default.ini`.
 
+To evaluate a checkpoint trained without an RNN, override recurrence on the command
+line without editing the INI:
+
+```bash
+python scripts/evaluate_test.py --checkpoint /path/to/mlp_model.pt --rnn-name None
+```
+
+`--rnn-name` accepts `None` (disable recurrence) or `Recurrent` (enable LSTM).
+It takes precedence over `rnn_name` in `--config`; omitting it preserves the INI
+setting. All four stages use the effective setting, which is recorded as
+`settings.rnn_name` in the JSON report (`null` when disabled). The checkpoint must
+match the selected architecture, and other network and action-space settings must
+still match training. This flag does not convert LSTM weights into a feedforward
+model; incompatible weights fail strict loading.
+
 ### Driving metrics: sanity, self-play and human replay
 
 All native fields exported by the Drive log binding are retained per scene and

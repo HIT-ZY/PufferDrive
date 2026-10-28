@@ -90,6 +90,8 @@ def parse_args(argv=None):
                         help="Inference-only episodes per sanity map (default: 10)")
     parser.add_argument("--config", type=Path, default=ROOT / "pufferlib/config/ocean/drive.ini",
                         help="Training INI (architecture and driving reward/goal settings)")
+    parser.add_argument("--rnn-name", choices=("None", "Recurrent"), default=None,
+                        help="Override the INI's rnn_name: None disables recurrence, Recurrent enables LSTM")
     options = parser.parse_args(argv)
     if len(set(options.sanity_maps)) != len(options.sanity_maps):
         parser.error("--sanity-maps must not contain duplicates")
@@ -667,6 +669,9 @@ def main(argv=None):
         if not options.checkpoint.is_file():
             raise FileNotFoundError(f"Missing checkpoint: {options.checkpoint}")
         config = load_settings(options.config)
+        if options.rnn_name is not None:
+            config["rnn_name"] = None if options.rnn_name == "None" else options.rnn_name
+            config["train"]["use_rnn"] = config["rnn_name"] is not None
         evaluate(options, config, report)
         report["status"] = ("failed" if any(stage["status"] not in ("complete", "skipped")
                                            for stage in report["stages"].values()) else "complete")

@@ -33,6 +33,63 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(options.stages, list(evaluation.STAGES))
         self.assertEqual(options.sanity_rollouts, 10)
 
+    def test_rnn_override_reaches_all_stages_and_report(self):
+        cases = (
+            ("Recurrent", None, "Recurrent"),
+            ("None", None, None),
+            ("Recurrent", "None", None),
+            ("None", "Recurrent", "Recurrent"),
+        )
+        source = (ROOT / "pufferlib/config/ocean/drive.ini").read_text()
+        for configured, override, expected in cases:
+            with self.subTest(configured=configured, override=override), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                checkpoint = root / "model.pt"
+                checkpoint.touch()
+                config_path = root / "drive.ini"
+                config_text = source.replace("rnn_name = Recurrent", f"rnn_name = {configured}")
+                config_path.write_text(config_text)
+                seen = []
+
+                def fake_stage(options, config, ids, report, mode, *args):
+                    seen.append(mode)
+                    self.assertEqual(config["rnn_name"], expected)
+                    self.assertEqual(config["train"]["use_rnn"], expected is not None)
+                    row = {"scenario_id": ids[0], "rollout": 0}
+                    if mode == "wosac":
+                        row.update({key: 0.5 for key in evaluation.WOSAC_METRICS})
+                        row["num_agents_per_scene"] = 1
+                    else:
+                        row.update(driving_row())
+                    if mode == "sanity":
+                        row["map_name"] = options.sanity_maps[0]
+                    report["per_scene"][mode].append(row)
+
+                args = ["--checkpoint", str(checkpoint), "--config", str(config_path),
+                        "--output-dir", str(root / "out"), "--num-maps", "1",
+                        "--sanity-maps", evaluation.SANITY_MAPS[0], "--sanity-rollouts", "1"]
+                if override is not None:
+                    args.extend(["--rnn-name", override])
+                with patch.object(evaluation, "run_stage", side_effect=fake_stage), \
+                     patch.object(evaluation, "prepare_sanity_maps",
+                                  return_value=(["scene_0"], [evaluation.SANITY_MAPS[0]])), \
+                     patch.object(evaluation, "validate_stage_maps", return_value=(["scene_0"], [], [])), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = evaluation.main(args)
+                report = json.loads(next((root / "out").glob("*.json")).read_text())
+                self.assertEqual(code, 0, report["stages"])
+                self.assertEqual(seen, list(evaluation.STAGES))
+                self.assertEqual(report["settings"]["rnn_name"], expected)
+                self.assertEqual(config_path.read_text(), config_text)
+
+    def test_invalid_rnn_override_is_rejected(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            evaluation.parse_args(["--checkpoint", "model.pt", "--rnn-name", "LSTM"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--rnn-name", stderr.getvalue())
+        self.assertIn("invalid choice", stderr.getvalue())
+
     def test_agent_weighted_metrics_and_goal_weighted_completion(self):
         rows = [driving_row(1, 1, 3, 2), driving_row(3, 0, 1, 0)]
         rows[0]["episode_return"], rows[1]["episode_return"] = 10, 2
