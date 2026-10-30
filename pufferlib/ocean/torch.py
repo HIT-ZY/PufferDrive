@@ -111,3 +111,19 @@ class Drive(nn.Module):
         value = self.value_fn(flat_hidden)
 
         return action, value
+
+
+class DriveMLP(Drive):
+    """Drive encoder and heads with two feedforward layers in place of the LSTM."""
+
+    def __init__(self, env, input_size=64, hidden_size=256, **kwargs):
+        super().__init__(env, input_size=input_size, hidden_size=hidden_size, **kwargs)
+        self.mlp = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
+        )
+
+    def encode_observations(self, observations, state=None):
+        return self.mlp(super().encode_observations(observations, state=state))

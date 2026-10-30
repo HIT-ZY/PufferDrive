@@ -90,7 +90,10 @@ def parse_args(argv=None):
                         help="Inference-only episodes per sanity map (default: 10)")
     parser.add_argument("--config", type=Path, default=ROOT / "pufferlib/config/ocean/drive.ini",
                         help="Training INI (architecture and driving reward/goal settings)")
-    parser.add_argument("--rnn-name", choices=("None", "Recurrent"), default=None,
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument("--model-type", choices=("mlp", "lstm"), default=None,
+                            help="Drive architecture: two-layer MLP or existing LSTM")
+    model_group.add_argument("--rnn-name", choices=("None", "Recurrent"), default=None,
                         help="Override the INI's rnn_name: None disables recurrence, Recurrent enables LSTM")
     options = parser.parse_args(argv)
     if len(set(options.sanity_maps)) != len(options.sanity_maps):
@@ -327,7 +330,9 @@ def check_metrics(row, keys, allow_none=()):
 def load_policy(config, env, checkpoint, device):
     import torch
     from pufferlib.ocean import torch as policy_module
+    from pufferlib.model_config import apply_model_type
 
+    apply_model_type(config)
     policy = getattr(policy_module, config["policy_name"])(env, **config["policy"])
     if config["rnn_name"] is not None:
         policy = getattr(policy_module, config["rnn_name"])(env, policy, **config["rnn"])
@@ -501,6 +506,7 @@ def evaluate(options, config, report):
         "driving_rollouts": options.driving_rollouts, "sanity_rollouts": options.sanity_rollouts,
         "wosac_rollouts": options.wosac_rollouts, "inference_only": True,
         "policy_name": config["policy_name"], "rnn_name": config["rnn_name"],
+        "model_type": config.get("model_type"),
         "policy": config["policy"], "rnn": config["rnn"],
         "driving_aggregation": "agent-episode weighted; completion uses total goal counts",
         "wosac_aggregation": "equal weight per scene; original tracks_to_predict only; population std",
@@ -669,7 +675,11 @@ def main(argv=None):
         if not options.checkpoint.is_file():
             raise FileNotFoundError(f"Missing checkpoint: {options.checkpoint}")
         config = load_settings(options.config)
+        if options.model_type is not None or config.get("model_type") is not None:
+            from pufferlib.model_config import apply_model_type
+            apply_model_type(config, options.model_type)
         if options.rnn_name is not None:
+            config.pop("model_type", None)
             config["rnn_name"] = None if options.rnn_name == "None" else options.rnn_name
             config["train"]["use_rnn"] = config["rnn_name"] is not None
         evaluate(options, config, report)

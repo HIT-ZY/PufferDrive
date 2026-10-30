@@ -77,7 +77,22 @@ Selected stages always follow the four-stage order, regardless of argument order
 Use `--config /path/to/drive.ini` if the checkpoint uses different architecture,
 action-space or reward settings. This config is merged over `config/default.ini`.
 
-To evaluate a checkpoint trained without an RNN, override recurrence on the command
+To evaluate the new two-layer MLP or the existing LSTM, select the architecture
+used during training:
+
+```bash
+python scripts/evaluate_test.py --checkpoint /path/to/mlp_model.pt --model-type mlp
+python scripts/evaluate_test.py --checkpoint /path/to/lstm_model.pt --model-type lstm
+```
+
+The MLP adds two `Linear(256, 256) → ReLU` layers between the existing encoder
+and actor/value heads with the default configuration. These widths follow
+`policy.hidden_size`. `--model-type` overrides the INI's policy/RNN selection;
+it cannot be combined with `--rnn-name` in this script. All stages use the same
+selection, recorded in `settings.model_type`, `policy_name`, and `rnn_name`.
+
+To evaluate an **original feedforward Drive** checkpoint (without the new MLP
+layers), override recurrence on the command
 line without editing the INI:
 
 ```bash

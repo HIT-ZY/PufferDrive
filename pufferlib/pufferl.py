@@ -35,6 +35,7 @@ import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
 import pufferlib.utils
+from pufferlib.model_config import apply_model_type
 
 from pufferlib.ocean.benchmark.evaluator import Evaluator
 
@@ -1355,6 +1356,7 @@ def load_env(env_name, args):
 
 
 def load_policy(args, vecenv, env_name=""):
+    apply_model_type(args)
     package = args["package"]
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)
@@ -1407,6 +1409,10 @@ def load_config(env_name, config_dir=None):
     )
     parser.add_argument("--load-model-path", type=str, default=None, help="Path to a pretrained checkpoint")
     parser.add_argument(
+        "--model-type", choices=("mlp", "lstm"), default=None,
+        help="Drive architecture: two-layer MLP or existing LSTM; overrides policy-name/rnn-name",
+    )
+    parser.add_argument(
         "--load-id", type=str, default=None, help="Kickstart/eval from from a finished Wandb/Neptune run"
     )
     parser.add_argument(
@@ -1457,6 +1463,9 @@ def load_config(env_name, config_dir=None):
 
     for section in p.sections():
         for key in p[section]:
+            if section == "base" and key == "model_type":
+                parser.set_defaults(model_type=puffer_type(p[section][key]))
+                continue
             fmt = f"--{key}" if section == "base" else f"--{section}.{key}"
             parser.add_argument(fmt.replace("_", "-"), default=puffer_type(p[section][key]), type=puffer_type)
 
@@ -1475,7 +1484,7 @@ def load_config(env_name, config_dir=None):
 
         prev[subkey] = value
 
-    args["train"]["use_rnn"] = args["rnn_name"] is not None
+    apply_model_type(args)
     return args
 
 

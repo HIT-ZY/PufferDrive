@@ -95,6 +95,32 @@ For more training data compatible with PufferDrive, see [ScenarioMax](https://gi
 </details>
 
 
+## Drive model selection
+
+Choose the architecture when training:
+
+```bash
+puffer train puffer_drive --model-type mlp
+puffer train puffer_drive --model-type lstm
+```
+
+Both models share the Drive observation encoder and actor/value heads. With the
+default configuration, `mlp` adds `Linear(256, 256) → ReLU → Linear(256, 256) → ReLU`
+between the encoder and heads. `lstm` uses the existing single-layer LSTM with
+256 input and hidden units. The MLP widths follow `policy.hidden_size`.
+
+`--model-type` overrides `policy_name` and `rnn_name` and sets the training
+recurrence flag automatically. Omitting it preserves the INI settings (LSTM by
+default). The original feedforward Drive remains available with `--rnn-name None`
+and no `--model-type`; it is a different architecture from the new two-layer MLP.
+
+Use the same selector when evaluating the resulting checkpoint:
+
+```bash
+python scripts/evaluate_test.py --checkpoint /path/to/model.pt --model-type mlp
+# For an LSTM checkpoint, use --model-type lstm instead.
+```
+
 ## Visualizer
 
 <details>
