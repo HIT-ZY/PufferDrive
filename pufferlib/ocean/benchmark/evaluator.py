@@ -2,6 +2,7 @@
 
 import copy
 import torch
+from pufferlib.sequence import make_history, forward_with_history
 import numpy as np
 import pandas as pd
 from typing import Dict
@@ -189,6 +190,8 @@ class WOSACEvaluator:
         for rollout_idx in range(self.num_rollouts):
             print(f"\rCollecting rollout {rollout_idx + 1}/{self.num_rollouts}...", end="", flush=True)
             obs, info = puffer_env.reset()
+            history = make_history(args, obs, device)
+            sequence_done = None
             state = {}
             if args["train"]["use_rnn"]:
                 state = dict(
@@ -211,14 +214,16 @@ class WOSACEvaluator:
                 # Step policy
                 with torch.no_grad():
                     ob_tensor = torch.as_tensor(obs).to(device)
-                    logits, value = policy.forward_eval(ob_tensor, state)
+                    logits, value = forward_with_history(
+                        policy, ob_tensor, state, history, sequence_done)
                     action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                     action_np = action.cpu().numpy().reshape(puffer_env.action_space.shape)
 
                 if isinstance(logits, torch.distributions.Normal):
                     action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
 
-                obs, _, _, truncations, _ = puffer_env.step(action_np)
+                obs, _, dones, truncations, _ = puffer_env.step(action_np)
+                sequence_done = np.logical_or(dones, truncations)
                 if np.any(truncations) and time_idx < self.sim_steps - 2:
                     raise RuntimeError("WOSAC episode ended before the final reference frame")
 
@@ -925,6 +930,9 @@ class Evaluator:
         # Reset environment
         obs, info = env.reset()
 
+        history = make_history(self.configs, obs, device)
+        sequence_done = None
+
         # Initialize RNN state if needed
         state = {}
         if self.configs["train"]["use_rnn"]:
@@ -941,7 +949,8 @@ class Evaluator:
             # Get action from policy
             with torch.no_grad():
                 ob_tensor = torch.as_tensor(obs).to(device)
-                logits, value = policy.forward_eval(ob_tensor, state)
+                logits, value = forward_with_history(
+                    policy, ob_tensor, state, history, sequence_done)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 action_np = action.cpu().numpy().reshape(env.action_space.shape)
 
@@ -951,6 +960,7 @@ class Evaluator:
 
             # Step environment
             obs, rewards, dones, truncs, info_list = env.step(action_np, per_env_logs=per_env_logs)
+            sequence_done = np.logical_or(dones, truncs)
 
             if truncs.all():
                 break

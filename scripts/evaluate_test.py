@@ -91,8 +91,10 @@ def parse_args(argv=None):
     parser.add_argument("--config", type=Path, default=ROOT / "pufferlib/config/ocean/drive.ini",
                         help="Training INI (architecture and driving reward/goal settings)")
     model_group = parser.add_mutually_exclusive_group()
-    model_group.add_argument("--model-type", choices=("mlp", "lstm"), default=None,
-                            help="Drive architecture: two-layer MLP or existing LSTM")
+    model_group.add_argument("--model-type", choices=("mlp", "lstm", "lstm_seq"), default=None,
+                            help="Drive architecture: MLP, stateful LSTM, or sliding-window LSTM")
+    parser.add_argument("--sequence-length", type=positive_int, default=None,
+                        help="lstm_seq observation window; must match training (INI default: 32)")
     model_group.add_argument("--rnn-name", choices=("None", "Recurrent"), default=None,
                         help="Override the INI's rnn_name: None disables recurrence, Recurrent enables LSTM")
     options = parser.parse_args(argv)
@@ -335,7 +337,10 @@ def load_policy(config, env, checkpoint, device):
     apply_model_type(config)
     policy = getattr(policy_module, config["policy_name"])(env, **config["policy"])
     if config["rnn_name"] is not None:
-        policy = getattr(policy_module, config["rnn_name"])(env, policy, **config["rnn"])
+        rnn_kwargs = dict(config["rnn"])
+        if config["train"].get("use_sequence", False):
+            rnn_kwargs["sequence_length"] = config["sequence_length"]
+        policy = getattr(policy_module, config["rnn_name"])(env, policy, **rnn_kwargs)
     weights = torch.load(checkpoint, map_location=device, weights_only=True)
     weights = {key.removeprefix("module."): value for key, value in weights.items()}
     policy.load_state_dict(weights, strict=True)
@@ -348,9 +353,12 @@ def rollout_driving(env, policy, config, seed):
     import torch
     from pufferlib.ocean.drive import binding
     from pufferlib.pytorch import sample_logits
+    from pufferlib.sequence import make_history, forward_with_history
 
     obs, _ = env.reset(seed=seed)
     device = config["train"]["device"]
+    history = make_history(config, obs, device)
+    sequence_done = None
     state = {}
     if config["train"]["use_rnn"]:
         state = {
@@ -359,12 +367,14 @@ def rollout_driving(env, policy, config, seed):
         }
     with torch.no_grad():
         for _ in range(env.episode_length - env.init_steps - 1):
-            logits, _ = policy.forward_eval(torch.as_tensor(obs, device=device), state)
+            logits, _ = forward_with_history(
+                policy, torch.as_tensor(obs, device=device), state, history, sequence_done)
             actions, _, _ = sample_logits(logits)
             actions = actions.cpu().numpy().reshape(env.action_space.shape)
             if isinstance(logits, torch.distributions.Normal):
                 actions = np.clip(actions, env.action_space.low, env.action_space.high)
-            obs, _, _, truncations, info = env.step(actions, per_env_logs=True)
+            obs, _, dones, truncations, info = env.step(actions, per_env_logs=True)
+            sequence_done = np.logical_or(dones, truncations)
             if truncations.all():
                 if len(info) != env.num_envs or not all(row.get("n", 0) > 0 for row in info):
                     raise RuntimeError("Missing scene logs at episode boundary")
@@ -507,12 +517,15 @@ def evaluate(options, config, report):
         "wosac_rollouts": options.wosac_rollouts, "inference_only": True,
         "policy_name": config["policy_name"], "rnn_name": config["rnn_name"],
         "model_type": config.get("model_type"),
+        "sequence_length": config.get("sequence_length") if config["train"].get("use_sequence") else None,
         "policy": config["policy"], "rnn": config["rnn"],
         "driving_aggregation": "agent-episode weighted; completion uses total goal counts",
         "wosac_aggregation": "equal weight per scene; original tracks_to_predict only; population std",
         "human_replay_control": "original dataset SDC only; other created agents replay logged trajectories",
         "sanity_solved_rule": "per-map mean score >= 0.95; not a safe-completion threshold",
-        "lstm_reset": "zero at rollout start only; no history warm-up or per-agent reset on respawn",
+        "lstm_reset": ("zero for every observation window; history repeats the first frame and resets per agent on done/truncated"
+                       if config["train"].get("use_sequence") else
+                       "zero at rollout start only; no history warm-up or per-agent reset on respawn"),
     }
     for mode in STAGES:
         status = report["stages"][mode]
@@ -675,13 +688,18 @@ def main(argv=None):
         if not options.checkpoint.is_file():
             raise FileNotFoundError(f"Missing checkpoint: {options.checkpoint}")
         config = load_settings(options.config)
-        if options.model_type is not None or config.get("model_type") is not None:
+        if options.sequence_length is not None:
+            config["sequence_length"] = options.sequence_length
+        if (options.model_type is not None or config.get("model_type") is not None
+                or config["rnn_name"] == "RecurrentSequence"):
             from pufferlib.model_config import apply_model_type
             apply_model_type(config, options.model_type)
         if options.rnn_name is not None:
             config.pop("model_type", None)
             config["rnn_name"] = None if options.rnn_name == "None" else options.rnn_name
             config["train"]["use_rnn"] = config["rnn_name"] is not None
+            config["train"]["use_sequence"] = False
+            config["train"]["model_type"] = None
         evaluate(options, config, report)
         report["status"] = ("failed" if any(stage["status"] not in ("complete", "skipped")
                                            for stage in report["stages"].values()) else "complete")

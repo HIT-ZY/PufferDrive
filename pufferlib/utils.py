@@ -6,7 +6,7 @@ import subprocess
 import json
 
 
-def run_wosac_eval_in_subprocess(config, logger, global_step):
+def run_wosac_eval_in_subprocess(config, logger, global_step, full_args=None):
     """
     Run WOSAC evaluation in a subprocess and log metrics to wandb.
 
@@ -53,6 +53,17 @@ def run_wosac_eval_in_subprocess(config, logger, global_step):
             "--eval.wosac-sanity-check",
             str(eval_config.get("wosac_sanity_check", False)),
         ]
+
+        if config.get("use_sequence", False):
+            cmd.extend(["--model-type", "lstm_seq", "--sequence-length", str(config["sequence_length"]),
+                        "--train.device", str(config["device"])])
+            # Preserve dimensions and observation/action layout in the child process.
+            for section in ("policy", "rnn"):
+                for key, value in (full_args or {}).get(section, {}).items():
+                    cmd.extend([f"--{section}.{key.replace('_', '-')}", str(value)])
+            for key in ("action_type", "dynamics_model"):
+                if key in (full_args or {}).get("env", {}):
+                    cmd.extend([f"--env.{key.replace('_', '-')}", str(full_args["env"][key])])
 
         if not model_files:
             print("No model files found for WOSAC evaluation. Running WOSAC with random policy.")

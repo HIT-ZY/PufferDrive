@@ -10,6 +10,7 @@ from pufferlib.models import Convolutional as Conv  # noqa: F401
 
 
 Recurrent = pufferlib.models.LSTMWrapper
+RecurrentSequence = pufferlib.models.LSTMSequenceWrapper
 
 
 class Drive(nn.Module):

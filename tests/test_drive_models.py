@@ -296,13 +296,16 @@ class DriveModelTests(unittest.TestCase):
             root = Path(directory)
             checkpoint = root / "model.pt"
             checkpoint.touch()
-            for kind in ("mlp", "lstm"):
+            for kind in ("mlp", "lstm", "lstm_seq"):
                 seen = []
 
                 def run_stage(options, config, ids, report, mode, *args):
                     seen.append(mode)
                     self.assertEqual(config["policy_name"], "DriveMLP" if kind == "mlp" else "Drive")
                     self.assertEqual(config["train"]["use_rnn"], kind == "lstm")
+                    if kind == "lstm_seq":
+                        self.assertTrue(config["train"]["use_sequence"])
+                        self.assertEqual(config["train"]["sequence_length"], 4)
                     row = {"scenario_id": ids[0], "rollout": 0}
                     if mode == "wosac":
                         row.update({key: 0.5 for key in evaluation.WOSAC_METRICS})
@@ -321,6 +324,7 @@ class DriveModelTests(unittest.TestCase):
                      contextlib.redirect_stdout(io.StringIO()):
                     code = evaluation.main([
                         "--checkpoint", str(checkpoint), "--model-type", kind,
+                        "--sequence-length", "4",
                         "--output-dir", str(root / kind), "--num-maps", "1",
                         "--sanity-rollouts", "1", "--sanity-maps", evaluation.SANITY_MAPS[0],
                     ])
@@ -328,7 +332,10 @@ class DriveModelTests(unittest.TestCase):
                 self.assertEqual(seen, list(evaluation.STAGES))
                 report = json.loads(next((root / kind).glob("*.json")).read_text())
                 self.assertEqual(report["settings"]["model_type"], kind)
-                self.assertEqual(report["settings"]["rnn_name"], "Recurrent" if kind == "lstm" else None)
+                self.assertEqual(report["settings"]["rnn_name"],
+                                 {"lstm": "Recurrent", "lstm_seq": "RecurrentSequence", "mlp": None}[kind])
+                if kind == "lstm_seq":
+                    self.assertEqual(report["settings"]["sequence_length"], 4)
 
     def test_evaluation_rejects_conflicting_selectors(self):
         evaluation = evaluation_module()

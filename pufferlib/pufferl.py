@@ -36,6 +36,7 @@ import pufferlib.vector
 import pufferlib.pytorch
 import pufferlib.utils
 from pufferlib.model_config import apply_model_type
+from pufferlib.sequence import ObservationHistory, make_history, forward_with_history, sequence_ppo_backward
 
 from pufferlib.ocean.benchmark.evaluator import Evaluator
 
@@ -130,6 +131,18 @@ class PuffeRL:
         self.ep_lengths = torch.zeros(total_agents, device=device, dtype=torch.int32)
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
+
+        self.observation_history = None
+        if config.get("use_sequence", False):
+            length = config["sequence_length"]
+            self.observation_history = ObservationHistory(
+                total_agents, length, obs_space.shape, device=device, dtype=self.observations.dtype)
+            self.sequence_prefixes = torch.zeros(
+                segments, length - 1, *obs_space.shape, dtype=self.observations.dtype,
+                device=self.observations.device,
+                pin_memory=device == "cuda" and config["cpu_offload"])
+            self.sequence_resets = torch.zeros(segments, rollout_horizon, dtype=torch.bool,
+                                               device=self.observations.device)
 
         # LSTM
         if config["use_rnn"]:
@@ -288,7 +301,8 @@ class PuffeRL:
                     state["lstm_h"] = self.lstm_h[env_id.start]
                     state["lstm_c"] = self.lstm_c[env_id.start]
 
-                logits, value = self.policy.forward_eval(o_device, state)
+                logits, value = forward_with_history(
+                    self.policy, o_device, state, self.observation_history, done_mask, env_id)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
@@ -301,6 +315,12 @@ class PuffeRL:
                 # Fast path for fully vectorized envs
                 l = self.ep_lengths[env_id.start].item()
                 batch_rows = slice(self.ep_indices[env_id.start].item(), 1 + self.ep_indices[env_id.stop - 1].item())
+
+                if self.observation_history is not None:
+                    if l == 0:
+                        self.sequence_prefixes[batch_rows] = self.observation_history.buffer[env_id, :-1].to(
+                            self.sequence_prefixes.device)
+                    self.sequence_resets[batch_rows, l] = done_mask.bool().to(self.sequence_resets.device)
 
                 if config["cpu_offload"]:
                     self.observations[batch_rows, l] = o
@@ -372,7 +392,8 @@ class PuffeRL:
 
         for mb in range(self.total_minibatches):
             profile("train_misc", epoch, nest=True)
-            self.amp_context.__enter__()
+            if not config.get("use_sequence", False):
+                self.amp_context.__enter__()
 
             shape = self.values.shape
             advantages = torch.zeros(shape, device=device)
@@ -394,7 +415,7 @@ class PuffeRL:
             prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs, self.minibatch_segments)
             mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
-            mb_obs = self.observations[idx]
+            mb_obs = None if config.get("use_sequence", False) else self.observations[idx]
             mb_actions = self.actions[idx]
             mb_logprobs = self.logprobs[idx]
             mb_rewards = self.rewards[idx]
@@ -404,6 +425,26 @@ class PuffeRL:
             mb_values = self.values[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
+
+            if config.get("use_sequence", False):
+                profile("train_forward", epoch)
+                ent_coef = self.ent_coef_initial
+                if config["anneal_entropy"]:
+                    ent_coef *= 0.5 * (1 + np.cos(np.pi * self.epoch / self.total_epochs))
+                metrics, newvalue, ratio = sequence_ppo_backward(
+                    self.policy, self.observations, self.sequence_prefixes, self.sequence_resets,
+                    idx, mb_actions, mb_logprobs, mb_values, mb_returns, mb_advantages, mb_prio,
+                    config, ent_coef, self.amp_context)
+                self.values[idx] = newvalue
+                self.ratio[idx] = ratio
+                for name, metric in metrics.items():
+                    losses[name] += metric / self.total_minibatches
+                profile("learn", epoch)
+                if (mb + 1) % self.accumulate_minibatches == 0:
+                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                continue
 
             profile("train_forward", epoch)
             if not config["use_rnn"]:
@@ -538,7 +579,8 @@ class PuffeRL:
             del self.evaluator
 
         if self.config["eval"]["wosac_realism_eval"]:
-            pufferlib.utils.run_wosac_eval_in_subprocess(self.config, self.logger, self.global_step)
+            pufferlib.utils.run_wosac_eval_in_subprocess(
+                self.config, self.logger, self.global_step, full_args=self.full_args)
 
     def mean_and_log(self):
         config = self.config
@@ -613,6 +655,8 @@ class PuffeRL:
             "model_name": model_name,
             "run_id": run_id,
         }
+        if self.config.get("use_sequence", False):
+            state.update(model_type="lstm_seq", sequence_length=self.config["sequence_length"])
         state_path = os.path.join(path, "trainer_state.pt")
         torch.save(state, state_path + ".tmp")
         os.rename(state_path + ".tmp", state_path)
@@ -655,6 +699,8 @@ class PuffeRL:
         s.add_column(f"{c1}Summary", justify="left", vertical="top", width=10)
         s.add_column(f"{c1}Value", justify="right", vertical="top", width=14)
         s.add_row(f"{c2}Env", f"{b2}{config['env']}")
+        if config.get("use_sequence", False):
+            s.add_row(f"{c2}Model", f"{b2}lstm_seq (N={config['sequence_length']})")
         s.add_row(f"{c2}Params", abbreviate(self.model_size, b2, c2))
         s.add_row(f"{c2}Steps", abbreviate(agent_steps, b2, c2))
         s.add_row(f"{c2}SPS", abbreviate(sps, b2, c2))
@@ -1119,6 +1165,8 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         device = args["train"]["device"]
 
         state = {}
+        history = make_history(args, ob, device)
+        sequence_done = None
         if args["train"]["use_rnn"]:
             state = dict(
                 lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
@@ -1134,7 +1182,8 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
             with torch.no_grad():
                 ob = torch.as_tensor(ob).to(device)
-                logits, value = policy.forward_eval(ob, state)
+                logits, value = forward_with_history(
+                    policy, ob, state, history, sequence_done)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 
@@ -1142,6 +1191,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
                 action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
             ob, reward, done, truncated, info = vecenv.step(action)
+            sequence_done = np.logical_or(done, truncated)
 
             if driver.render_mode == 1:
                 frame_count += 1
@@ -1368,7 +1418,10 @@ def load_policy(args, vecenv, env_name=""):
     rnn_name = args["rnn_name"]
     if rnn_name is not None:
         rnn_cls = getattr(env_module.torch, args["rnn_name"])
-        policy = rnn_cls(vecenv.driver_env, policy, **args["rnn"])
+        rnn_kwargs = dict(args["rnn"])
+        if args["train"].get("use_sequence", False):
+            rnn_kwargs["sequence_length"] = args["sequence_length"]
+        policy = rnn_cls(vecenv.driver_env, policy, **rnn_kwargs)
 
     policy = policy.to(device)
 
@@ -1409,8 +1462,8 @@ def load_config(env_name, config_dir=None):
     )
     parser.add_argument("--load-model-path", type=str, default=None, help="Path to a pretrained checkpoint")
     parser.add_argument(
-        "--model-type", choices=("mlp", "lstm"), default=None,
-        help="Drive architecture: two-layer MLP or existing LSTM; overrides policy-name/rnn-name",
+        "--model-type", choices=("mlp", "lstm", "lstm_seq"), default=None,
+        help="Drive architecture: MLP, stateful LSTM, or sliding-window LSTM; overrides policy-name/rnn-name",
     )
     parser.add_argument(
         "--load-id", type=str, default=None, help="Kickstart/eval from from a finished Wandb/Neptune run"

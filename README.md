@@ -134,6 +134,34 @@ python scripts/evaluate_test.py --checkpoint /path/to/model.pt --model-type mlp
 # For an LSTM checkpoint, use --model-type lstm instead.
 ```
 
+### Sliding-window LSTM
+
+`lstm_seq` uses the same encoder, LSTM parameters, initialization, and actor/value
+heads as `lstm`. Each action is predicted from the last N raw observations,
+including the current observation. Training and inference both start the LSTM
+from zero state for each window and use only its final output. Callers retain
+observation history, never a recurrent hidden state.
+
+```bash
+puffer train puffer_drive --model-type lstm_seq --sequence-length 32
+python scripts/evaluate_test.py --checkpoint /path/to/model.pt --model-type lstm_seq --sequence-length 32
+puffer eval puffer_drive --load-model-path /path/to/model.pt --model-type lstm_seq --sequence-length 32
+```
+
+N defaults to 32 and is independent of `train.rollout_horizon`. Short histories
+repeat the first observation on the left. Each vehicle's history resets on
+termination/truncation; environment resets and map changes also clear history.
+History survives rollout-batch boundaries and optimizer updates. Use the same
+model selector and N when loading a weight-only checkpoint for evaluation.
+
+Training reconstructs each action's original window from observations and segment
+prefixes and processes the entire training minibatch with one forward/backward
+pass. Inference also processes the entire observation batch in one forward pass.
+There is no additional sequence chunking; the trainer's existing PPO minibatch
+and gradient accumulation settings still apply. Recomputing complete windows uses
+more activation memory and computation than stateful LSTM inference. The original
+`lstm` and both feedforward modes are unchanged.
+
 ## Visualizer
 
 <details>

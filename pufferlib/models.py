@@ -196,6 +196,39 @@ class LSTMWrapper(nn.Module):
         return logits, values
 
 
+class LSTMSequenceWrapper(LSTMWrapper):
+    """A stateless sliding-window LSTM, predicting only the final timestep.
+
+    Inheriting the constructor preserves the original parameter initialization,
+    parameter count and weight-only checkpoint layout (including cell aliases).
+    The cell is never used here and no hidden state is carried between calls.
+    """
+
+    def __init__(self, env, policy, input_size=128, hidden_size=128, sequence_length=32):
+        if isinstance(sequence_length, bool) or not isinstance(sequence_length, int) or sequence_length < 1:
+            raise ValueError("sequence_length must be a positive integer")
+        super().__init__(env, policy, input_size, hidden_size)
+        self.sequence_length = sequence_length
+
+    def forward(self, observations, state=None):
+        if (observations.ndim != len(self.obs_shape) + 2
+                or observations.shape[1] != self.sequence_length
+                or tuple(observations.shape[2:]) != tuple(self.obs_shape)):
+            raise ValueError("Expected observations shaped [B, sequence_length, *obs_shape]")
+        if state is not None and ("lstm_h" in state or "lstm_c" in state):
+            raise ValueError("lstm_seq does not accept a recurrent hidden state")
+        batch, length = observations.shape[:2]
+        encoded = self.policy.encode_observations(
+            observations.reshape(batch * length, *self.obs_shape), state=state)
+        encoded = encoded.reshape(batch, length, self.input_size).transpose(0, 1)
+        # Omitting (h_0, c_0) initializes both to zero on every call.
+        output, _ = self.lstm(encoded)
+        return self.policy.decode_actions(output[-1].float())
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+
 class Convolutional(nn.Module):
     def __init__(
         self,
