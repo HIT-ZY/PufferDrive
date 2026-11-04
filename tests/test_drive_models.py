@@ -306,6 +306,7 @@ class DriveModelTests(unittest.TestCase):
                     if kind == "lstm_seq":
                         self.assertTrue(config["train"]["use_sequence"])
                         self.assertEqual(config["train"]["sequence_length"], 4)
+                        self.assertEqual(config["train"]["sequence_chunks"], 3)
                     row = {"scenario_id": ids[0], "rollout": 0}
                     if mode == "wosac":
                         row.update({key: 0.5 for key in evaluation.WOSAC_METRICS})
@@ -325,6 +326,7 @@ class DriveModelTests(unittest.TestCase):
                     code = evaluation.main([
                         "--checkpoint", str(checkpoint), "--model-type", kind,
                         "--sequence-length", "4",
+                        "--sequence-chunks", "3",
                         "--output-dir", str(root / kind), "--num-maps", "1",
                         "--sanity-rollouts", "1", "--sanity-maps", evaluation.SANITY_MAPS[0],
                     ])
@@ -336,6 +338,7 @@ class DriveModelTests(unittest.TestCase):
                                  {"lstm": "Recurrent", "lstm_seq": "RecurrentSequence", "mlp": None}[kind])
                 if kind == "lstm_seq":
                     self.assertEqual(report["settings"]["sequence_length"], 4)
+                    self.assertEqual(report["settings"]["sequence_chunks"], 3)
 
     def test_evaluation_rejects_conflicting_selectors(self):
         evaluation = evaluation_module()

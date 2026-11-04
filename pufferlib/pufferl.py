@@ -303,7 +303,7 @@ class PuffeRL:
 
                 logits, value = forward_with_history(
                     self.policy, o_device, state, self.observation_history, done_mask, env_id,
-                    config["max_minibatch_size"])
+                    config["max_minibatch_size"], config.get("sequence_chunks", 0))
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
@@ -657,7 +657,8 @@ class PuffeRL:
             "run_id": run_id,
         }
         if self.config.get("use_sequence", False):
-            state.update(model_type="lstm_seq", sequence_length=self.config["sequence_length"])
+            state.update(model_type="lstm_seq", sequence_length=self.config["sequence_length"],
+                         sequence_chunks=self.config.get("sequence_chunks", 0))
         state_path = os.path.join(path, "trainer_state.pt")
         torch.save(state, state_path + ".tmp")
         os.rename(state_path + ".tmp", state_path)
@@ -702,6 +703,7 @@ class PuffeRL:
         s.add_row(f"{c2}Env", f"{b2}{config['env']}")
         if config.get("use_sequence", False):
             s.add_row(f"{c2}Model", f"{b2}lstm_seq (N={config['sequence_length']})")
+            s.add_row(f"{c2}Seq chunks", f"{b2}{config.get('sequence_chunks', 0) or 'auto'}")
         s.add_row(f"{c2}Params", abbreviate(self.model_size, b2, c2))
         s.add_row(f"{c2}Steps", abbreviate(agent_steps, b2, c2))
         s.add_row(f"{c2}SPS", abbreviate(sps, b2, c2))
@@ -1185,7 +1187,8 @@ def eval(env_name, args=None, vecenv=None, policy=None):
                 ob = torch.as_tensor(ob).to(device)
                 logits, value = forward_with_history(
                     policy, ob, state, history, sequence_done,
-                    max_minibatch_size=args["train"]["max_minibatch_size"])
+                    max_minibatch_size=args["train"]["max_minibatch_size"],
+                    sequence_chunks=args["train"].get("sequence_chunks", 0))
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 

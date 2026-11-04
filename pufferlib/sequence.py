@@ -43,14 +43,38 @@ def make_history(config, observations, device):
                               device=device, dtype=obs.dtype)
 
 
+def sequence_slices(count, sequence_length, max_minibatch_size, sequence_chunks=0):
+    """Partition whole windows; explicit counts produce balanced nonempty chunks.
+
+    Zero preserves the automatic observation-budget rule. An explicit count
+    overrides that rule, independently of N; at most one chunk per sample.
+    """
+    if isinstance(sequence_chunks, bool) or not isinstance(sequence_chunks, int) or sequence_chunks < 0:
+        raise ValueError("sequence_chunks must be a non-negative integer (0 = automatic)")
+    if count == 0:
+        return
+    if sequence_chunks:
+        chunks = min(count, sequence_chunks)
+        size, extra = divmod(count, chunks)
+        start = 0
+        for index in range(chunks):
+            stop = start + size + (index < extra)
+            yield slice(start, stop)
+            start = stop
+    else:
+        size = max(1, max_minibatch_size // sequence_length)
+        for start in range(0, count, size):
+            yield slice(start, min(count, start + size))
+
+
 def forward_with_history(policy, observations, state, history=None, done=None,
-                         agent_slice=None, max_minibatch_size=32768):
+                         agent_slice=None, max_minibatch_size=32768, sequence_chunks=0):
     """Keep legacy calls unchanged; bound sequence inference activation memory."""
     if history is None:
         return policy.forward_eval(observations, state)
     windows = history.append(observations, done, agent_slice)
-    chunk_size = max(1, max_minibatch_size // windows.shape[1])
-    outputs = [policy.forward_eval(chunk, state) for chunk in windows.split(chunk_size)]
+    parts = sequence_slices(len(windows), windows.shape[1], max_minibatch_size, sequence_chunks)
+    outputs = [policy.forward_eval(windows[part], state) for part in parts]
     if len(outputs) == 1:
         return outputs[0]
     logits, values = zip(*outputs)
@@ -111,13 +135,12 @@ def sequence_ppo_backward(policy, observations, prefixes, resets, rows, actions,
     metrics = dict.fromkeys(("policy_loss", "value_loss", "entropy", "old_approx_kl",
                             "approx_kl", "clipfrac", "importance"), 0.0)
     length = prefixes.shape[1] + 1
-    chunk_size = max(1, config["max_minibatch_size"] // length)
-    for start in range(0, count, chunk_size):
-        stop = min(count, start + chunk_size)
+    parts = sequence_slices(count, length, config["max_minibatch_size"], config.get("sequence_chunks", 0))
+    for part in parts:
+        start, stop = part.start, part.stop
         positions = torch.arange(start, stop, device=storage_device)
         windows = reconstruct_windows(observations, prefixes, resets,
                                       rows[positions // horizon], positions % horizon).to(device)
-        part = slice(start, stop)
         weight = (stop - start) / count
         with amp_context:
             logits, value = policy(windows, {})

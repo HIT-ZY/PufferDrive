@@ -24,4 +24,9 @@ def apply_model_type(config, model_type=None):
             raise ValueError("sequence_length must be a positive integer")
         config["sequence_length"] = length
         config["train"]["sequence_length"] = length
+        chunks = config.get("sequence_chunks", 0)
+        if isinstance(chunks, bool) or not isinstance(chunks, int) or chunks < 0:
+            raise ValueError("sequence_chunks must be a non-negative integer (0 = automatic)")
+        config["sequence_chunks"] = chunks
+        config["train"]["sequence_chunks"] = chunks
     config["train"]["model_type"] = model_type

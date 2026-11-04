@@ -56,6 +56,7 @@ def run_wosac_eval_in_subprocess(config, logger, global_step, full_args=None):
 
         if config.get("use_sequence", False):
             cmd.extend(["--model-type", "lstm_seq", "--sequence-length", str(config["sequence_length"]),
+                        "--sequence-chunks", str(config.get("sequence_chunks", 0)),
                         "--train.device", str(config["device"]),
                         "--train.max-minibatch-size", str(config["max_minibatch_size"])])
             # Preserve dimensions and observation/action layout in the child process.

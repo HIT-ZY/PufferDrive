@@ -154,17 +154,31 @@ termination/truncation; environment resets and map changes also clear history.
 History survives rollout-batch boundaries and optimizer updates. Use the same
 model selector and N when loading a weight-only checkpoint for evaluation.
 
-Training reconstructs each action's original window from observations and segment
-prefixes on demand, in chunks of at most
-`max(1, train.max_minibatch_size // N)` complete windows. Inference uses the same
-chunk limit. Each N-step sequence stays intact. Training normalizes advantages
-over the minibatch and weights each chunk's loss by its sample count before
-accumulating gradients; clipping and optimizer updates keep their original timing.
-With N=32 and the default maximum minibatch size of 32768, each chunk contains up
-to 1024 windows. Lowering `--train.max-minibatch-size` to 8192 reduces this to 256;
-the existing PPO minibatch/gradient accumulation rules still apply. Chunking bounds
-activation memory, but observation history and rollout buffers still occupy memory.
-The original `lstm` and both feedforward modes are unchanged.
+Set `--sequence-chunks` independently of N in training and all evaluation entrypoints:
+
+```bash
+puffer train puffer_drive --model-type lstm_seq --sequence-length 16 --sequence-chunks 8
+python scripts/evaluate_test.py --checkpoint /path/to/model.pt --model-type lstm_seq --sequence-length 16 --sequence-chunks 4
+puffer eval puffer_drive --load-model-path /path/to/model.pt --model-type lstm_seq --sequence-length 16 --sequence-chunks 4
+```
+
+The default `--sequence-chunks 0` preserves automatic chunking, with at most
+`max(1, train.max_minibatch_size // N)` complete windows per chunk. A positive K
+overrides that rule and splits each actual training minibatch, or each inference
+observation batch, into K balanced chunks. Sizes differ by at most one; if there
+are fewer than K samples, each sample gets its own chunk. `--sequence-chunks 1`
+processes the whole batch at once. N must match training when evaluating; the
+chunk count may differ and does not change the checkpoint architecture.
+
+For an actual minibatch of 32768 samples, N=16 and K=8 means eight chunks of 4096
+complete sequences. The existing `train.minibatch_size` / `train.max_minibatch_size`
+rules still determine the actual minibatch and optimizer accumulation schedule;
+changing K alone does not change those settings. Training reconstructs windows
+on demand, normalizes advantages over the minibatch and weights each chunk's
+loss by its sample count before accumulating gradients. Each N-step sequence stays
+intact, and clipping/optimizer updates keep their original timing. More chunks
+reduce activation memory per call, while observation history and rollout buffers
+still occupy memory. The original `lstm` and both feedforward modes are unchanged.
 
 ## Visualizer
 

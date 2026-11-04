@@ -216,7 +216,8 @@ class WOSACEvaluator:
                     ob_tensor = torch.as_tensor(obs).to(device)
                     logits, value = forward_with_history(
                         policy, ob_tensor, state, history, sequence_done,
-                        max_minibatch_size=args["train"].get("max_minibatch_size", 32768))
+                        max_minibatch_size=args["train"].get("max_minibatch_size", 32768),
+                        sequence_chunks=args["train"].get("sequence_chunks", 0))
                     action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                     action_np = action.cpu().numpy().reshape(puffer_env.action_space.shape)
 
@@ -952,7 +953,8 @@ class Evaluator:
                 ob_tensor = torch.as_tensor(obs).to(device)
                 logits, value = forward_with_history(
                     policy, ob_tensor, state, history, sequence_done,
-                    max_minibatch_size=self.configs["train"].get("max_minibatch_size", 32768))
+                    max_minibatch_size=self.configs["train"].get("max_minibatch_size", 32768),
+                    sequence_chunks=self.configs["train"].get("sequence_chunks", 0))
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 action_np = action.cpu().numpy().reshape(env.action_space.shape)
 

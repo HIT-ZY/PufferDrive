@@ -52,10 +52,11 @@ class SequenceTests(unittest.TestCase):
     def tearDown(self):
         torch.set_num_threads(self.old_threads)
 
-    def config(self, selector, length=4):
+    def config(self, selector, length=4, chunks=None):
         training = training_functions(selector)
+        chunk_args = [] if chunks is None else ["--sequence-chunks", str(chunks)]
         with patch.object(sys, "argv", ["puffer", "--model-type", "lstm_seq", "--sequence-length", str(length),
-                                       "--train.device", "cpu"]):
+                                       "--train.device", "cpu", *chunk_args]):
             return training.load_config("puffer_drive")
 
     def model(self, models, length=4, env=None):
@@ -72,6 +73,7 @@ class SequenceTests(unittest.TestCase):
             self.assertTrue(config["train"]["use_sequence"])
             self.assertEqual(config["rnn_name"], "RecurrentSequence")
             self.assertEqual(config["train"]["sequence_length"], 8)
+            self.assertEqual(config["train"]["sequence_chunks"], 0)
             self.assertEqual(config["train"]["rollout_horizon"], 32)
             with patch.object(sys, "argv", ["puffer", "--model-type", "lstm_seq"]):
                 self.assertEqual(training.load_config("puffer_drive")["sequence_length"], 32)
@@ -91,6 +93,52 @@ class SequenceTests(unittest.TestCase):
                 b, vb = restored.forward_eval(inputs)
             torch.testing.assert_close(a[0], b[0])
             torch.testing.assert_close(va, vb)
+
+    def test_chunk_config_cli_ini_and_validation(self):
+        with policy_modules() as (_, selector), tempfile.TemporaryDirectory() as directory:
+            training = training_functions(selector)
+            evaluation = evaluation_module()
+            for length in (1, 16, 32):
+                for chunks in (0, 1, 8):
+                    config = self.config(selector, length, chunks)
+                    self.assertEqual(config["sequence_chunks"], chunks)
+                    self.assertEqual(config["train"]["sequence_chunks"], chunks)
+                    self.assertEqual(config["train"]["sequence_length"], length)
+                    self.assertEqual(config["train"]["minibatch_size"], 32768)
+                    self.assertEqual(config["train"]["max_minibatch_size"], 32768)
+                    args = evaluation.parse_args(["--checkpoint", "test.pt", "--sequence-chunks", str(chunks)])
+                    self.assertEqual(args.sequence_chunks, chunks)
+            for bad in (-1, 1.5, True, "auto"):
+                with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "non-negative integer"):
+                    self.config(selector, chunks=bad)
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    evaluation.parse_args(["--checkpoint", "test.pt", "--sequence-chunks", str(bad)])
+            # Same INI value is accepted by both loaders; CLI can restore auto with 0.
+            root = Path(directory)
+            (root / "config/ocean").mkdir(parents=True)
+            (root / "config/default.ini").write_text((ROOT / "pufferlib/config/default.ini").read_text())
+            ini = root / "config/ocean/drive.ini"
+            source = (ROOT / "pufferlib/config/ocean/drive.ini").read_text()
+            ini.write_text(source.replace("sequence_chunks = 0", "sequence_chunks = 5"))
+            for arguments, expected in (([], 5), (["--sequence-chunks", "0"], 0), (["--sequence-chunks", "3"], 3)):
+                with patch.object(sys, "argv", ["puffer", "--model-type", "lstm_seq", *arguments]):
+                    cfg = training.load_config("puffer_drive", config_dir=str(root))
+                self.assertEqual(cfg["train"]["sequence_chunks"], expected)
+            cfg = evaluation.load_settings(ini)
+            selector.apply_model_type(cfg, "lstm_seq")
+            self.assertEqual(cfg["train"]["sequence_chunks"], 5)
+
+    def test_explicit_chunk_counts_are_balanced_and_independent_of_length(self):
+        with policy_modules():
+            seq = importlib.import_module("pufferlib.sequence")
+            for length in (1, 16, 32):
+                for count, chunks, sizes in ((6, 4, [2, 2, 1, 1]), (7, 3, [3, 2, 2]),
+                                              (6, 1, [6]), (3, 100, [1, 1, 1])):
+                    parts = list(seq.sequence_slices(count, length, 1, chunks))
+                    self.assertEqual([p.stop - p.start for p in parts], sizes)
+                    self.assertEqual([i for p in parts for i in range(p.start, p.stop)], list(range(count)))
+            self.assertEqual([p.stop - p.start for p in seq.sequence_slices(6, 4, 20)], [5, 1])
+            self.assertEqual([p.stop - p.start for p in seq.sequence_slices(3, 32, 1)], [1, 1, 1])
 
     def test_same_initialization_final_output_and_stateless_calls(self):
         with policy_modules() as (models, _):
@@ -178,20 +226,7 @@ class SequenceTests(unittest.TestCase):
             old_values = old_values.reshape(2, 3) + .4
             returns, advantages = torch.randn(2, 3), torch.randn(2, 3)
             importance = torch.tensor([[.7], [1.4]])
-            # Six windows split into five plus one: the short final chunk must
-            # use its sample fraction, not the same weight as the first chunk.
             config = dict(max_minibatch_size=20, clip_coef=.2, vf_clip_coef=.2, vf_coef=2.)
-            with patch.object(model, "forward", wraps=model.forward) as forward, \
-                 patch.object(torch.autograd, "backward", wraps=torch.autograd.backward) as backward:
-                metrics, new_values, ratios = seq.sequence_ppo_backward(
-                    model, obs, prefixes, resets, torch.arange(2), actions.reshape(2, 3, 1),
-                    old_logprob.reshape(2, 3), old_values, returns, advantages, importance,
-                    config, .005, contextlib.nullcontext())
-            self.assertEqual(forward.call_count, 2)
-            self.assertEqual(backward.call_count, 2)
-            self.assertEqual([call.args[0].shape[0] for call in forward.call_args_list], [5, 1])
-            torch.testing.assert_close(torch.cat([call.args[0] for call in forward.call_args_list]),
-                                       windows, atol=0, rtol=0)
             logits, values = reference(windows)
             _, logprob, entropy = sample_logits(logits, action=actions)
             ratio = (logprob - old_logprob).exp().reshape(2, 3)
@@ -201,14 +236,28 @@ class SequenceTests(unittest.TestCase):
             clipped = old_values + (values - old_values).clamp(-.2, .2)
             vl = .5 * torch.maximum((values - returns).square(), (clipped - returns).square()).mean()
             (pg + 2 * vl - .005 * entropy.mean()).backward()
-            self.assertAlmostEqual(metrics["policy_loss"], pg.item(), places=6)
-            self.assertAlmostEqual(metrics["value_loss"], vl.item(), places=6)
-            torch.testing.assert_close(new_values, values)
-            torch.testing.assert_close(ratios, ratio)
-            for (name, param), (_, expected) in zip(model.named_parameters(), reference.named_parameters()):
-                self.assertIsNotNone(param.grad, name)
-                self.assertGreater(param.grad.abs().sum().item(), 0, name)
-                torch.testing.assert_close(param.grad, expected.grad, atol=2e-6, rtol=2e-4, msg=name)
+            for chunks, sizes in ((0, [5, 1]), (1, [6]), (4, [2, 2, 1, 1]), (99, [1] * 6)):
+                with self.subTest(chunks=chunks):
+                    model.zero_grad(set_to_none=True)
+                    with patch.object(model, "forward", wraps=model.forward) as forward, \
+                         patch.object(torch.autograd, "backward", wraps=torch.autograd.backward) as backward:
+                        metrics, new_values, ratios = seq.sequence_ppo_backward(
+                            model, obs, prefixes, resets, torch.arange(2), actions.reshape(2, 3, 1),
+                            old_logprob.reshape(2, 3), old_values, returns, advantages, importance,
+                            dict(config, sequence_chunks=chunks), .005, contextlib.nullcontext())
+                    self.assertEqual(forward.call_count, len(sizes))
+                    self.assertEqual(backward.call_count, len(sizes))
+                    self.assertEqual([call.args[0].shape[0] for call in forward.call_args_list], sizes)
+                    torch.testing.assert_close(torch.cat([call.args[0] for call in forward.call_args_list]),
+                                               windows, atol=0, rtol=0)
+                    self.assertAlmostEqual(metrics["policy_loss"], pg.item(), places=6)
+                    self.assertAlmostEqual(metrics["value_loss"], vl.item(), places=6)
+                    torch.testing.assert_close(new_values, values)
+                    torch.testing.assert_close(ratios, ratio)
+                    for (name, param), (_, expected) in zip(model.named_parameters(), reference.named_parameters()):
+                        self.assertIsNotNone(param.grad, name)
+                        self.assertGreater(param.grad.abs().sum().item(), 0, name)
+                        torch.testing.assert_close(param.grad, expected.grad, atol=2e-6, rtol=2e-4, msg=name)
 
     def test_continuous_inference_chunks_preserve_order_and_outputs(self):
         with policy_modules() as (models, _):
@@ -218,24 +267,26 @@ class SequenceTests(unittest.TestCase):
             env.single_action_space.shape = (2,)
             model = self.model(models, env=env)
             obs = observations(3)
-            history = seq.ObservationHistory(3, 4, (1121,), device="cpu")
             with torch.no_grad():
-                with patch.object(model, "forward_eval", wraps=model.forward_eval) as forward:
-                    actual, values = seq.forward_with_history(model, obs, {}, history, max_minibatch_size=8)
-                self.assertEqual(forward.call_count, 2)
-                self.assertEqual([call.args[0].shape for call in forward.call_args_list],
-                                 [(2, 4, 1121), (1, 4, 1121)])
                 expected, target = model(obs[:, None].expand(-1, 4, -1))
-            torch.testing.assert_close(actual.loc, expected.loc)
-            torch.testing.assert_close(actual.scale, expected.scale)
-            torch.testing.assert_close(values, target)
+                for chunks, sizes in ((0, [2, 1]), (1, [3]), (2, [2, 1]), (4, [1, 1, 1])):
+                    history = seq.ObservationHistory(3, 4, (1121,), device="cpu")
+                    with patch.object(model, "forward_eval", wraps=model.forward_eval) as forward:
+                        actual, values = seq.forward_with_history(
+                            model, obs, {}, history, max_minibatch_size=8, sequence_chunks=chunks)
+                    self.assertEqual(forward.call_count, len(sizes))
+                    self.assertEqual([call.args[0].shape for call in forward.call_args_list],
+                                     [(size, 4, 1121) for size in sizes])
+                    torch.testing.assert_close(actual.loc, expected.loc)
+                    torch.testing.assert_close(actual.scale, expected.scale)
+                    torch.testing.assert_close(values, target)
 
     def test_real_trainer_rollout_update_and_cross_batch_history(self):
         with policy_modules() as (models, selector), tempfile.TemporaryDirectory() as directory:
             seq = importlib.import_module("pufferlib.sequence")
             Trainer = load_trainer(seq)
             env = FakeVectorEnv()
-            config = self.config(selector)["train"]
+            config = self.config(selector, chunks=2)["train"]
             config.update(batch_size=8, rollout_horizon=2, minibatch_size=8, max_minibatch_size=4,
                           total_timesteps=24, optimizer="adam", update_epochs=1, compile=False,
                           env="puffer_drive", data_dir=directory, checkpoint_interval=1,
@@ -260,8 +311,8 @@ class SequenceTests(unittest.TestCase):
                 with patch.object(trainer.optimizer, "step", wraps=trainer.optimizer.step) as step, \
                      patch.object(model, "forward", wraps=model.forward) as forward:
                     trainer.train()
-                self.assertEqual(forward.call_count, trainer.total_minibatches * trainer.minibatch_size)
-                self.assertTrue(all(call.args[0].shape == (1, 4, 1121)
+                self.assertEqual(forward.call_count, trainer.total_minibatches * 2)
+                self.assertTrue(all(call.args[0].shape == (2, 4, 1121)
                                     for call in forward.call_args_list))
                 self.assertEqual(step.call_count, 1)  # two logical minibatches, accumulated once
                 self.assertFalse(torch.equal(before["lstm.weight_ih_l0"], model.lstm.weight_ih_l0))
@@ -274,12 +325,12 @@ class SequenceTests(unittest.TestCase):
                 self.assertTrue(all(torch.isfinite(torch.tensor(v)) for v in trainer.losses.values()))
                 state = torch.load(next(Path(directory).rglob("trainer_state.pt")), weights_only=True)
                 self.assertEqual((state["model_type"], state["sequence_length"]), ("lstm_seq", 4))
+                self.assertEqual(state["sequence_chunks"], 2)
 
     def test_all_inference_entrypoints_use_the_same_windows(self):
         with policy_modules() as (models, selector):
             seq = importlib.import_module("pufferlib.sequence")
-            config = self.config(selector)
-            config["train"]["max_minibatch_size"] = 4
+            config = self.config(selector, chunks=2)
             config["eval"].update(wosac_realism_eval=False, human_replay_eval=False)
             model = self.model(models)
 
@@ -349,17 +400,17 @@ class SequenceTests(unittest.TestCase):
             old_values = torch.zeros(8, 8, device="cuda")
             returns, advantages = torch.randn(8, 8, device="cuda"), torch.randn(8, 8, device="cuda")
             importance = torch.ones(8, 1, device="cuda")
-            config = dict(clip_coef=.2, vf_clip_coef=.2, vf_coef=2.)
+            config = dict(clip_coef=.2, vf_clip_coef=.2, vf_coef=2., max_minibatch_size=64 * 8)
             # Warm up both recurrent passes before comparing allocated memory.
             model(obs[:1])[1].sum().backward()
             peaks = []
-            for token_budget in (64 * 8, 4 * 8):
+            for chunks in (1, 16):
                 model.zero_grad(set_to_none=True)
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
                 seq.sequence_ppo_backward(
                     model, obs, prefixes, resets, rows, actions, old_logprobs, old_values,
-                    returns, advantages, importance, dict(config, max_minibatch_size=token_budget),
+                    returns, advantages, importance, dict(config, sequence_chunks=chunks),
                     .005, contextlib.nullcontext())
                 torch.cuda.synchronize()
                 peaks.append(torch.cuda.max_memory_allocated())
@@ -444,7 +495,7 @@ class SequenceTests(unittest.TestCase):
 
     def test_wosac_subprocess_preserves_sequence_settings(self):
         with policy_modules() as (_, selector), tempfile.TemporaryDirectory() as directory:
-            config = self.config(selector, 8)
+            config = self.config(selector, 8, chunks=5)
             config["policy"]["hidden_size"] = 16
             config["train"].update(data_dir=directory, env="puffer_drive")
             utils = importlib.import_module("pufferlib.utils")
@@ -453,6 +504,7 @@ class SequenceTests(unittest.TestCase):
                 utils.run_wosac_eval_in_subprocess(config["train"], SimpleNamespace(run_id="test"), 0, config)
             command = run.call_args.args[0]
             for flag, value in (("--model-type", "lstm_seq"), ("--sequence-length", "8"),
+                                ("--sequence-chunks", "5"),
                                 ("--policy.hidden-size", "16"), ("--train.device", "cpu"),
                                 ("--train.max-minibatch-size", str(config["train"]["max_minibatch_size"]))):
                 self.assertEqual(command[command.index(flag) + 1], value)

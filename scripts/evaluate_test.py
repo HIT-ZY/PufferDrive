@@ -66,6 +66,13 @@ def positive_int(value):
     return value
 
 
+def nonnegative_int(value):
+    value = int(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer (0 = automatic)")
+    return value
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True, help="Trained .pt state_dict")
@@ -95,6 +102,8 @@ def parse_args(argv=None):
                             help="Drive architecture: MLP, stateful LSTM, or sliding-window LSTM")
     parser.add_argument("--sequence-length", type=positive_int, default=None,
                         help="lstm_seq observation window; must match training (INI default: 32)")
+    parser.add_argument("--sequence-chunks", type=nonnegative_int, default=None,
+                        help="lstm_seq chunks per inference batch: 0=automatic, 1=one batch; may differ from training")
     model_group.add_argument("--rnn-name", choices=("None", "Recurrent"), default=None,
                         help="Override the INI's rnn_name: None disables recurrence, Recurrent enables LSTM")
     options = parser.parse_args(argv)
@@ -369,7 +378,8 @@ def rollout_driving(env, policy, config, seed):
         for _ in range(env.episode_length - env.init_steps - 1):
             logits, _ = forward_with_history(
                 policy, torch.as_tensor(obs, device=device), state, history, sequence_done,
-                max_minibatch_size=config["train"]["max_minibatch_size"])
+                max_minibatch_size=config["train"]["max_minibatch_size"],
+                sequence_chunks=config["train"].get("sequence_chunks", 0))
             actions, _, _ = sample_logits(logits)
             actions = actions.cpu().numpy().reshape(env.action_space.shape)
             if isinstance(logits, torch.distributions.Normal):
@@ -519,6 +529,7 @@ def evaluate(options, config, report):
         "policy_name": config["policy_name"], "rnn_name": config["rnn_name"],
         "model_type": config.get("model_type"),
         "sequence_length": config.get("sequence_length") if config["train"].get("use_sequence") else None,
+        "sequence_chunks": config.get("sequence_chunks", 0) if config["train"].get("use_sequence") else None,
         "policy": config["policy"], "rnn": config["rnn"],
         "driving_aggregation": "agent-episode weighted; completion uses total goal counts",
         "wosac_aggregation": "equal weight per scene; original tracks_to_predict only; population std",
@@ -691,6 +702,8 @@ def main(argv=None):
         config = load_settings(options.config)
         if options.sequence_length is not None:
             config["sequence_length"] = options.sequence_length
+        if options.sequence_chunks is not None:
+            config["sequence_chunks"] = options.sequence_chunks
         if (options.model_type is not None or config.get("model_type") is not None
                 or config["rnn_name"] == "RecurrentSequence"):
             from pufferlib.model_config import apply_model_type
