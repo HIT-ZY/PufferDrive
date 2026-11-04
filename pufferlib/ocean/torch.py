@@ -61,7 +61,7 @@ class Drive(nn.Module):
         self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1)
 
     def forward(self, observations, state=None):
-        hidden = self.encode_observations(observations)
+        hidden = self.encode_observations(observations, state=state, for_head=True)
         actions, value = self.decode_actions(hidden)
         return actions, value
 
@@ -69,11 +69,16 @@ class Drive(nn.Module):
         return self.forward(x, state)
 
     def forward_eval(self, observations, state=None):
-        hidden = self.encode_observations(observations, state=state)
+        hidden = self.encode_observations(observations, state=state, for_head=True)
         logits, values = self.decode_actions(hidden)
         return logits, values
 
-    def encode_observations(self, observations, state=None):
+    def encode_observations(self, observations, state=None, *, for_head=False):
+        """Use tanh only for direct feedforward predictions.
+
+        Recurrent wrappers call this without for_head, retaining the original
+        ReLU encoder features as LSTM inputs.
+        """
         ego_dim = self.ego_dim
         partner_dim = self.max_partner_objects * self.partner_features
         road_dim = self.max_road_objects * self.road_features
@@ -95,9 +100,8 @@ class Drive(nn.Module):
         concat_features = torch.cat([ego_features, road_features, partner_features], dim=1)
 
         # Pass through shared embedding
-        embedding = F.relu(self.shared_embedding(concat_features))
-        # embedding = self.shared_embedding(concat_features)
-        return embedding
+        embedding = self.shared_embedding(concat_features)
+        return torch.tanh(embedding) if for_head else F.relu(embedding)
 
     def decode_actions(self, flat_hidden):
         if self.is_continuous:
@@ -123,8 +127,9 @@ class DriveMLP(Drive):
             pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.ReLU(),
             pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
-            nn.ReLU(),
         )
 
-    def encode_observations(self, observations, state=None):
-        return self.mlp(super().encode_observations(observations, state=state))
+    def encode_observations(self, observations, state=None, *, for_head=False):
+        # Keep the common encoder's ReLU; bound only the final MLP features.
+        hidden = self.mlp(super().encode_observations(observations, state=state))
+        return torch.tanh(hidden) if for_head else F.relu(hidden)

@@ -85,11 +85,16 @@ python scripts/evaluate_test.py --checkpoint /path/to/mlp_model.pt --model-type 
 python scripts/evaluate_test.py --checkpoint /path/to/lstm_model.pt --model-type lstm
 ```
 
-The MLP adds two `Linear(256, 256) → ReLU` layers between the existing encoder
-and actor/value heads with the default configuration. These widths follow
+The MLP adds `Linear(256, 256) → ReLU → Linear(256, 256) → Tanh` between the
+existing encoder and actor/value heads with the default configuration. These widths follow
 `policy.hidden_size`. `--model-type` overrides the INI's policy/RNN selection;
 it cannot be combined with `--rnn-name` in this script. All stages use the same
 selection, recorded in `settings.model_type`, `policy_name`, and `rnn_name`.
+
+Both feedforward models always use Tanh before the actor/value heads, bounding
+their final feature vector to [-1, 1]. The original feedforward Drive replaces
+its encoder's final ReLU, while DriveMLP replaces the final MLP ReLU. LSTM
+behavior is unchanged. Training and evaluation use the same fixed activation.
 
 To evaluate an **original feedforward Drive** checkpoint (without the new MLP
 layers), override recurrence on the command

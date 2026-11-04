@@ -105,7 +105,7 @@ puffer train puffer_drive --model-type lstm
 ```
 
 Both models share the Drive observation encoder and actor/value heads. With the
-default configuration, `mlp` adds `Linear(256, 256) → ReLU → Linear(256, 256) → ReLU`
+default configuration, `mlp` adds `Linear(256, 256) → ReLU → Linear(256, 256) → Tanh`
 between the encoder and heads. `lstm` uses the existing single-layer LSTM with
 256 input and hidden units. The MLP widths follow `policy.hidden_size`.
 
@@ -114,12 +114,18 @@ recurrence flag automatically. Omitting it preserves the INI settings (LSTM by
 default). The original feedforward Drive remains available with `--rnn-name None`
 and no `--model-type`; it is a different architecture from the new two-layer MLP.
 
+Both feedforward variants always use Tanh before the actor/value heads. This
+replaces the final ReLU before the actor/value heads and bounds each input
+feature to [-1, 1], including negative values. It does not bound the final action
+logits or value prediction. For the original feedforward Drive, the replacement
+is at the encoder output; for DriveMLP, it is after the second MLP linear layer.
+The LSTM path keeps its original ReLU encoder input and recurrent output.
+
 Both feedforward variants initialize the shared encoder and actor/value linear
 layers with orthogonal gain 1 and zero biases, matching the LSTM policy's
 initialization. LayerNorm weights remain 1 and biases 0. The two additional MLP
 layers retain orthogonal gain sqrt(2). This aligns initialization schemes, not
 the exact random weights: the LSTM wrapper still reinitializes its policy.
-Existing checkpoints remain compatible; loading weights overrides initialization.
 
 Use the same selector when evaluating the resulting checkpoint:
 

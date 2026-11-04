@@ -153,10 +153,76 @@ class DriveModelTests(unittest.TestCase):
                             torch.testing.assert_close(layer.weight, torch.ones_like(layer.weight))
                             torch.testing.assert_close(layer.bias, torch.zeros_like(layer.bias))
 
-            # The extra ReLU MLP layers keep their original sqrt(2) gain.
+            # The additional MLP linear layers keep their original sqrt(2) gain.
             for layer in policies["mlp"].mlp:
                 if isinstance(layer, torch.nn.Linear):
                     assert_orthogonal(layer, gain=np.sqrt(2))
+
+    def test_feedforward_head_inputs_are_bounded_and_signed(self):
+        with policy_modules() as (models, selector):
+            training = training_functions(selector)
+            for arguments in (("--model-type", "mlp"), ("--rnn-name", "None")):
+                config = self.config(training, *arguments)
+                model = training.load_policy(config, SimpleNamespace(driver_env=fake_env()))
+                # Exercise both tails, including negative preactivations, without
+                # relying on the randomly initialized model to produce large values.
+                last_linear = model.mlp[-1] if isinstance(model, models.DriveMLP) else model.shared_embedding[-1]
+                with torch.no_grad():
+                    last_linear.weight.zero_()
+                    last_linear.bias.copy_(torch.linspace(-20, 20, model.hidden_size))
+                obs = observations()
+                outputs = []
+                for method in ("forward", "forward_train", "forward_eval"):
+                    with self.subTest(arguments=arguments, method=method):
+                        seen = {}
+                        hooks = [head.register_forward_pre_hook(
+                            lambda module, inputs, name=name: seen.__setitem__(name, inputs[0].detach().clone()))
+                            for name, head in (("actor", model.actor), ("value", model.value_fn))]
+                        try:
+                            outputs.append(getattr(model, method)(obs))
+                        finally:
+                            for hook in hooks:
+                                hook.remove()
+                        features = seen["actor"]
+                        torch.testing.assert_close(features, seen["value"])
+                        self.assertTrue(torch.isfinite(features).all())
+                        self.assertTrue((features.abs() <= 1).all())
+                        self.assertLess(features.min().item(), -0.99)
+                        self.assertGreater(features.max().item(), 0.99)
+                for logits, values in outputs[1:]:
+                    torch.testing.assert_close(logits[0], outputs[0][0][0])
+                    torch.testing.assert_close(values, outputs[0][1])
+
+    def test_lstm_keeps_relu_encoder_and_recurrent_head_features(self):
+        with policy_modules() as (_, selector):
+            training = training_functions(selector)
+            config = self.config(training, "--model-type", "lstm")
+            model = training.load_policy(config, SimpleNamespace(driver_env=fake_env()))
+            with torch.no_grad():
+                model.policy.shared_embedding[-1].weight.zero_()
+                model.policy.shared_embedding[-1].bias.copy_(torch.linspace(-20, 20, model.hidden_size))
+            obs = observations(6)
+            for method, inputs, recurrent in ((model.forward_eval, obs, model.cell),
+                                               (model.forward, obs.reshape(2, 3, -1), model.lstm)):
+                seen = {}
+                hooks = [module.register_forward_pre_hook(
+                    lambda module, inputs, name=name: seen.__setitem__(name, inputs[0].detach().clone()))
+                    for name, module in (("actor", model.policy.actor), ("value", model.policy.value_fn))]
+                state = {"lstm_h": None, "lstm_c": None}
+                try:
+                    # The training wrapper calls lstm.forward directly, bypassing
+                    # module hooks, so observe the forward call itself.
+                    with patch.object(recurrent, "forward", wraps=recurrent.forward) as recurrent_forward:
+                        method(inputs, state)
+                        recurrent_inputs = recurrent_forward.call_args.args[0]
+                finally:
+                    for hook in hooks:
+                        hook.remove()
+                self.assertEqual(recurrent_inputs.min().item(), 0)
+                self.assertEqual(recurrent_inputs.max().item(), 20)
+                expected = state["hidden"].detach().reshape(-1, model.hidden_size)
+                torch.testing.assert_close(seen["actor"], expected, atol=0, rtol=0)
+                torch.testing.assert_close(seen["value"], expected, atol=0, rtol=0)
 
     def test_mlp_forward_backward_and_no_memory(self):
         with policy_modules() as (models, _):
