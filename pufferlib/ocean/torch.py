@@ -24,30 +24,31 @@ class Drive(nn.Module):
         self.road_features_after_onehot = env.road_features + 6  # 6 is the number of one-hot encoded categories
         self.ego_dim = env.ego_features
 
+        # Match LSTMWrapper's gain-1 policy initialization in both feedforward variants.
         self.ego_encoder = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size), std=1.0),
             nn.LayerNorm(input_size),
             # nn.ReLU(),
-            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size), std=1.0),
         )
 
         self.road_encoder = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(self.road_features_after_onehot, input_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(self.road_features_after_onehot, input_size), std=1.0),
             nn.LayerNorm(input_size),
             # nn.ReLU(),
-            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size), std=1.0),
         )
 
         self.partner_encoder = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(self.partner_features, input_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(self.partner_features, input_size), std=1.0),
             nn.LayerNorm(input_size),
             # nn.ReLU(),
-            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size), std=1.0),
         )
 
         self.shared_embedding = nn.Sequential(
             nn.GELU(),
-            pufferlib.pytorch.layer_init(nn.Linear(3 * input_size, hidden_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(3 * input_size, hidden_size), std=1.0),
         )
         self.is_continuous = isinstance(env.single_action_space, pufferlib.spaces.Box)
 
@@ -56,7 +57,7 @@ class Drive(nn.Module):
         else:
             self.atn_dim = env.single_action_space.nvec.tolist()
 
-        self.actor = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, sum(self.atn_dim)), std=0.01)
+        self.actor = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, sum(self.atn_dim)), std=1.0)
         self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1)
 
     def forward(self, observations, state=None):

@@ -114,6 +114,13 @@ recurrence flag automatically. Omitting it preserves the INI settings (LSTM by
 default). The original feedforward Drive remains available with `--rnn-name None`
 and no `--model-type`; it is a different architecture from the new two-layer MLP.
 
+Both feedforward variants initialize the shared encoder and actor/value linear
+layers with orthogonal gain 1 and zero biases, matching the LSTM policy's
+initialization. LayerNorm weights remain 1 and biases 0. The two additional MLP
+layers retain orthogonal gain sqrt(2). This aligns initialization schemes, not
+the exact random weights: the LSTM wrapper still reinitializes its policy.
+Existing checkpoints remain compatible; loading weights overrides initialization.
+
 Use the same selector when evaluating the resulting checkpoint:
 
 ```bash

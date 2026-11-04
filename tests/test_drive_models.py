@@ -121,6 +121,43 @@ class DriveModelTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.config(training, "--model-type", "invalid")
 
+    def test_shared_initialization_matches_lstm(self):
+        with policy_modules() as (models, selector):
+            training = training_functions(selector)
+            policies = {}
+            for kind, arguments in (
+                ("lstm", ("--model-type", "lstm")),
+                ("mlp", ("--model-type", "mlp")),
+                ("feedforward", ("--rnn-name", "None")),
+            ):
+                torch.manual_seed(42)
+                config = self.config(training, *arguments)
+                model = training.load_policy(config, SimpleNamespace(driver_env=fake_env()))
+                policies[kind] = model.policy if kind == "lstm" else model
+
+            def assert_orthogonal(layer, gain):
+                weight = layer.weight.detach()
+                gram = weight @ weight.T if weight.shape[0] <= weight.shape[1] else weight.T @ weight
+                torch.testing.assert_close(gram, gain ** 2 * torch.eye(gram.shape[0]), atol=1e-6, rtol=1e-5)
+                torch.testing.assert_close(layer.bias, torch.zeros_like(layer.bias))
+
+            for name, reference in policies["lstm"].named_modules():
+                if not isinstance(reference, (torch.nn.Linear, torch.nn.LayerNorm)):
+                    continue
+                for kind, policy in policies.items():
+                    with self.subTest(kind=kind, layer=name):
+                        layer = policy.get_submodule(name)
+                        if isinstance(reference, torch.nn.Linear):
+                            assert_orthogonal(layer, gain=1.0)
+                        else:
+                            torch.testing.assert_close(layer.weight, torch.ones_like(layer.weight))
+                            torch.testing.assert_close(layer.bias, torch.zeros_like(layer.bias))
+
+            # The extra ReLU MLP layers keep their original sqrt(2) gain.
+            for layer in policies["mlp"].mlp:
+                if isinstance(layer, torch.nn.Linear):
+                    assert_orthogonal(layer, gain=np.sqrt(2))
+
     def test_mlp_forward_backward_and_no_memory(self):
         with policy_modules() as (models, _):
             model = models.DriveMLP(fake_env())
@@ -151,21 +188,28 @@ class DriveModelTests(unittest.TestCase):
         with policy_modules() as (models, selector), tempfile.TemporaryDirectory() as directory:
             training = training_functions(selector)
             evaluation = evaluation_module()
-            for kind in ("mlp", "lstm"):
+            for kind in ("mlp", "lstm", "feedforward"):
                 with self.subTest(kind=kind):
-                    config = self.config(training, "--model-type", kind)
+                    arguments = ("--rnn-name", "None") if kind == "feedforward" else ("--model-type", kind)
+                    config = self.config(training, *arguments)
                     env = fake_env()
                     model = training.load_policy(config, SimpleNamespace(driver_env=env))
                     if kind == "lstm":
                         self.assertIsInstance(model, models.Recurrent)
                         self.assertIsInstance(model.policy, models.Drive)
                         self.assertFalse(hasattr(model.policy, "mlp"))
-                    else:
+                    elif kind == "mlp":
                         self.assertIsInstance(model, models.DriveMLP)
+                    else:
+                        self.assertIsInstance(model, models.Drive)
+                        self.assertFalse(hasattr(model, "mlp"))
                     checkpoint = Path(directory) / f"{kind}.pt"
                     torch.save(model.state_dict(), checkpoint)
                     eval_config = evaluation.load_settings(ROOT / "pufferlib/config/ocean/drive.ini")
-                    selector.apply_model_type(eval_config, kind)
+                    if kind == "feedforward":
+                        eval_config["rnn_name"] = None
+                    else:
+                        selector.apply_model_type(eval_config, kind)
                     restored = evaluation.load_policy(eval_config, env, checkpoint, "cpu")
                     state_a = {"lstm_h": None, "lstm_c": None}
                     state_b = {"lstm_h": None, "lstm_c": None}
@@ -176,7 +220,7 @@ class DriveModelTests(unittest.TestCase):
                         torch.testing.assert_close(logits_a[0], logits_b[0])
                         torch.testing.assert_close(value_a, value_b)
                     wrong_config = evaluation.load_settings(ROOT / "pufferlib/config/ocean/drive.ini")
-                    selector.apply_model_type(wrong_config, "lstm" if kind == "mlp" else "mlp")
+                    selector.apply_model_type(wrong_config, "mlp" if kind == "lstm" else "lstm")
                     with self.assertRaises(RuntimeError):
                         evaluation.load_policy(wrong_config, env, checkpoint, "cpu")
 
