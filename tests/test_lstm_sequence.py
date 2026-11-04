@@ -159,7 +159,7 @@ class SequenceTests(unittest.TestCase):
                 fresh = history.append(torch.tensor([[999.], [888.]]))
                 torch.testing.assert_close(fresh[:, 0], fresh[:, -1], atol=0, rtol=0)
 
-    def test_full_minibatch_ppo_uses_one_forward_and_backward(self):
+    def test_uneven_chunks_match_full_minibatch_loss_and_gradients(self):
         with policy_modules() as (models, _):
             seq = importlib.import_module("pufferlib.sequence")
             from pufferlib.pytorch import sample_logits
@@ -178,16 +178,20 @@ class SequenceTests(unittest.TestCase):
             old_values = old_values.reshape(2, 3) + .4
             returns, advantages = torch.randn(2, 3), torch.randn(2, 3)
             importance = torch.tensor([[.7], [1.4]])
-            config = dict(max_minibatch_size=8, clip_coef=.2, vf_clip_coef=.2, vf_coef=2.)
+            # Six windows split into five plus one: the short final chunk must
+            # use its sample fraction, not the same weight as the first chunk.
+            config = dict(max_minibatch_size=20, clip_coef=.2, vf_clip_coef=.2, vf_coef=2.)
             with patch.object(model, "forward", wraps=model.forward) as forward, \
                  patch.object(torch.autograd, "backward", wraps=torch.autograd.backward) as backward:
                 metrics, new_values, ratios = seq.sequence_ppo_backward(
                     model, obs, prefixes, resets, torch.arange(2), actions.reshape(2, 3, 1),
                     old_logprob.reshape(2, 3), old_values, returns, advantages, importance,
                     config, .005, contextlib.nullcontext())
-            self.assertEqual(forward.call_count, 1)
-            self.assertEqual(backward.call_count, 1)
-            torch.testing.assert_close(forward.call_args.args[0], windows, atol=0, rtol=0)
+            self.assertEqual(forward.call_count, 2)
+            self.assertEqual(backward.call_count, 2)
+            self.assertEqual([call.args[0].shape[0] for call in forward.call_args_list], [5, 1])
+            torch.testing.assert_close(torch.cat([call.args[0] for call in forward.call_args_list]),
+                                       windows, atol=0, rtol=0)
             logits, values = reference(windows)
             _, logprob, entropy = sample_logits(logits, action=actions)
             ratio = (logprob - old_logprob).exp().reshape(2, 3)
@@ -206,7 +210,7 @@ class SequenceTests(unittest.TestCase):
                 self.assertGreater(param.grad.abs().sum().item(), 0, name)
                 torch.testing.assert_close(param.grad, expected.grad, atol=2e-6, rtol=2e-4, msg=name)
 
-    def test_continuous_inference_uses_one_forward_for_the_entire_batch(self):
+    def test_continuous_inference_chunks_preserve_order_and_outputs(self):
         with policy_modules() as (models, _):
             seq = importlib.import_module("pufferlib.sequence")
             env = fake_env()
@@ -217,9 +221,10 @@ class SequenceTests(unittest.TestCase):
             history = seq.ObservationHistory(3, 4, (1121,), device="cpu")
             with torch.no_grad():
                 with patch.object(model, "forward_eval", wraps=model.forward_eval) as forward:
-                    actual, values = seq.forward_with_history(model, obs, {}, history)
-                self.assertEqual(forward.call_count, 1)
-                self.assertEqual(forward.call_args.args[0].shape, (3, 4, 1121))
+                    actual, values = seq.forward_with_history(model, obs, {}, history, max_minibatch_size=8)
+                self.assertEqual(forward.call_count, 2)
+                self.assertEqual([call.args[0].shape for call in forward.call_args_list],
+                                 [(2, 4, 1121), (1, 4, 1121)])
                 expected, target = model(obs[:, None].expand(-1, 4, -1))
             torch.testing.assert_close(actual.loc, expected.loc)
             torch.testing.assert_close(actual.scale, expected.scale)
@@ -255,8 +260,8 @@ class SequenceTests(unittest.TestCase):
                 with patch.object(trainer.optimizer, "step", wraps=trainer.optimizer.step) as step, \
                      patch.object(model, "forward", wraps=model.forward) as forward:
                     trainer.train()
-                self.assertEqual(forward.call_count, trainer.total_minibatches)
-                self.assertTrue(all(call.args[0].shape == (trainer.minibatch_size, 4, 1121)
+                self.assertEqual(forward.call_count, trainer.total_minibatches * trainer.minibatch_size)
+                self.assertTrue(all(call.args[0].shape == (1, 4, 1121)
                                     for call in forward.call_args_list))
                 self.assertEqual(step.call_count, 1)  # two logical minibatches, accumulated once
                 self.assertFalse(torch.equal(before["lstm.weight_ih_l0"], model.lstm.weight_ih_l0))
@@ -274,6 +279,7 @@ class SequenceTests(unittest.TestCase):
         with policy_modules() as (models, selector):
             seq = importlib.import_module("pufferlib.sequence")
             config = self.config(selector)
+            config["train"]["max_minibatch_size"] = 4
             config["eval"].update(wosac_realism_eval=False, human_replay_eval=False)
             model = self.model(models)
 
@@ -315,15 +321,49 @@ class SequenceTests(unittest.TestCase):
                         evaluator.rollout_driving(env, model, config, seed=42)
                     else:
                         wosac(SimpleNamespace(sim_steps=7, num_rollouts=2), config, env, model)
-                self.assertEqual(len(captured), 12 if entrypoint == "wosac" else 6)
+                self.assertEqual(len(captured), 24 if entrypoint == "wosac" else 12)
+                self.assertTrue(all(part.shape == (1, 4, 1121) for part in captured))
+                actual = torch.cat(captured).reshape(-1, 2, 4, 1121)
                 if expected is None:
-                    expected = torch.stack(captured)
-                actual = torch.stack(captured)
+                    expected = actual
                 torch.testing.assert_close(actual[:6], expected, atol=0, rtol=0)
                 if entrypoint == "wosac":
                     torch.testing.assert_close(actual[6:], expected, atol=0, rtol=0)
             self.assertEqual(expected[2, 0, :, 0].tolist(), [2., 2., 2., 2.])
             self.assertEqual(expected[2, 1, :, 0].tolist(), [100., 100., 101., 102.])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
+    def test_chunking_reduces_cuda_peak_training_memory(self):
+        with policy_modules() as (models, _):
+            seq = importlib.import_module("pufferlib.sequence")
+            env = fake_env()
+            model = models.RecurrentSequence(
+                env, models.Drive(env, input_size=64, hidden_size=256),
+                input_size=256, hidden_size=256, sequence_length=8).cuda()
+            obs = observations(64).reshape(8, 8, -1).cuda()
+            prefixes = obs[:, :1].expand(-1, 7, -1).clone()
+            resets = torch.zeros(8, 8, device="cuda", dtype=torch.bool)
+            rows = torch.arange(8, device="cuda")
+            actions = torch.zeros(8, 8, 1, device="cuda", dtype=torch.int32)
+            old_logprobs = torch.full((8, 8), -4.5, device="cuda")
+            old_values = torch.zeros(8, 8, device="cuda")
+            returns, advantages = torch.randn(8, 8, device="cuda"), torch.randn(8, 8, device="cuda")
+            importance = torch.ones(8, 1, device="cuda")
+            config = dict(clip_coef=.2, vf_clip_coef=.2, vf_coef=2.)
+            # Warm up both recurrent passes before comparing allocated memory.
+            model(obs[:1])[1].sum().backward()
+            peaks = []
+            for token_budget in (64 * 8, 4 * 8):
+                model.zero_grad(set_to_none=True)
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                seq.sequence_ppo_backward(
+                    model, obs, prefixes, resets, rows, actions, old_logprobs, old_values,
+                    returns, advantages, importance, dict(config, max_minibatch_size=token_budget),
+                    .005, contextlib.nullcontext())
+                torch.cuda.synchronize()
+                peaks.append(torch.cuda.max_memory_allocated())
+            self.assertLess(peaks[1], peaks[0], f"Chunked/full CUDA memory: {peaks[1]}/{peaks[0]}")
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
     def test_cuda_training_with_amp_and_cpu_offload(self):
@@ -350,14 +390,21 @@ class SequenceTests(unittest.TestCase):
                         trainer.evaluate()
                     self.assertTrue(all(torch.isfinite(torch.tensor(v)) for v in trainer.losses.values()))
                     self.assertTrue(all(torch.isfinite(p).all() for p in model.parameters()))
-                    # Verify the second rollout also has matching recomputed probabilities.
+                    # Use the configured chunk size when checking probabilities:
+                    # different CUDA batch shapes can select different GEMM kernels.
                     from pufferlib.pytorch import sample_logits
                     with torch.no_grad(), trainer.amp_context:
                         positions = torch.arange(8, device=trainer.observations.device)
                         windows = seq.reconstruct_windows(trainer.observations, trainer.sequence_prefixes,
                                                           trainer.sequence_resets, positions // 2, positions % 2).cuda()
-                        logits, _ = model(windows)
-                        _, logprob, _ = sample_logits(logits, action=trainer.actions.reshape(8, -1))
+                        chunk_size = max(1, config["max_minibatch_size"] // config["sequence_length"])
+                        parts = []
+                        for inputs, actions in zip(windows.split(chunk_size),
+                                                   trainer.actions.reshape(8, -1).split(chunk_size)):
+                            logits, _ = model(inputs)
+                            _, part, _ = sample_logits(logits, action=actions)
+                            parts.append(part)
+                        logprob = torch.cat(parts)
                     torch.testing.assert_close(logprob.reshape(4, 2).float(), trainer.logprobs,
                                                atol=1e-6, rtol=1e-6)
 
@@ -406,7 +453,8 @@ class SequenceTests(unittest.TestCase):
                 utils.run_wosac_eval_in_subprocess(config["train"], SimpleNamespace(run_id="test"), 0, config)
             command = run.call_args.args[0]
             for flag, value in (("--model-type", "lstm_seq"), ("--sequence-length", "8"),
-                                ("--policy.hidden-size", "16"), ("--train.device", "cpu")):
+                                ("--policy.hidden-size", "16"), ("--train.device", "cpu"),
+                                ("--train.max-minibatch-size", str(config["train"]["max_minibatch_size"]))):
                 self.assertEqual(command[command.index(flag) + 1], value)
 
 

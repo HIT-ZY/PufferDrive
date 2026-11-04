@@ -368,7 +368,8 @@ def rollout_driving(env, policy, config, seed):
     with torch.no_grad():
         for _ in range(env.episode_length - env.init_steps - 1):
             logits, _ = forward_with_history(
-                policy, torch.as_tensor(obs, device=device), state, history, sequence_done)
+                policy, torch.as_tensor(obs, device=device), state, history, sequence_done,
+                max_minibatch_size=config["train"]["max_minibatch_size"])
             actions, _, _ = sample_logits(logits)
             actions = actions.cpu().numpy().reshape(env.action_space.shape)
             if isinstance(logits, torch.distributions.Normal):

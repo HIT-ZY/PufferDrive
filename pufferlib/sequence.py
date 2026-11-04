@@ -43,12 +43,25 @@ def make_history(config, observations, device):
                               device=device, dtype=obs.dtype)
 
 
-def forward_with_history(policy, observations, state, history=None, done=None, agent_slice=None):
-    """Evaluate the entire observation batch in one call."""
+def forward_with_history(policy, observations, state, history=None, done=None,
+                         agent_slice=None, max_minibatch_size=32768):
+    """Keep legacy calls unchanged; bound sequence inference activation memory."""
     if history is None:
         return policy.forward_eval(observations, state)
     windows = history.append(observations, done, agent_slice)
-    return policy.forward_eval(windows, state)
+    chunk_size = max(1, max_minibatch_size // windows.shape[1])
+    outputs = [policy.forward_eval(chunk, state) for chunk in windows.split(chunk_size)]
+    if len(outputs) == 1:
+        return outputs[0]
+    logits, values = zip(*outputs)
+    if isinstance(logits[0], torch.distributions.Normal):
+        logits = torch.distributions.Normal(torch.cat([x.loc for x in logits]),
+                                            torch.cat([x.scale for x in logits]))
+    elif isinstance(logits[0], torch.Tensor):
+        logits = torch.cat(logits)
+    else:
+        logits = [torch.cat(head) for head in zip(*logits)]
+    return logits, torch.cat(values)
 
 
 def reconstruct_windows(observations, prefixes, resets, rows, times):
@@ -78,8 +91,9 @@ def reconstruct_windows(observations, prefixes, resets, rows, times):
 def sequence_ppo_backward(policy, observations, prefixes, resets, rows, actions,
                           old_logprobs, old_values, returns, advantages, importance,
                           config, entropy_coef, amp_context):
-    """Reconstruct and backpropagate the entire PPO minibatch in one call.
+    """Backpropagate one PPO minibatch without materializing all its windows.
 
+    Normalize advantages once and weight chunk means by their sample count.
     The caller owns gradient clipping/optimizer steps at the original boundaries.
     """
     from pufferlib.pytorch import sample_logits
@@ -92,28 +106,44 @@ def sequence_ppo_backward(policy, observations, prefixes, resets, rows, actions,
     rows = rows.to(storage_device)
     adv = (importance * (advantages - advantages.mean()) / (advantages.std() + 1e-8)).flatten()
     flat_actions = actions.reshape(count, *actions.shape[2:])
-    positions = torch.arange(count, device=storage_device)
-    windows = reconstruct_windows(observations, prefixes, resets,
-                                  rows[positions // horizon], positions % horizon).to(device)
-    with amp_context:
-        logits, value = policy(windows, {})
-        _, logprob, entropy = sample_logits(logits, action=flat_actions)
-        logratio = logprob.reshape(-1) - old_logprobs.flatten()
-        ratio = logratio.exp()
-        policy_loss = torch.maximum(-adv * ratio, -adv * ratio.clamp(
-            1 - config["clip_coef"], 1 + config["clip_coef"])).mean()
-        value = value.reshape(-1)
-        old_value = old_values.flatten()
-        clipped = old_value + (value - old_value).clamp(-config["vf_clip_coef"], config["vf_clip_coef"])
-        target = returns.flatten()
-        value_loss = 0.5 * torch.maximum((value - target).square(), (clipped - target).square()).mean()
-        entropy_loss = entropy.mean()
-        loss = policy_loss + config["vf_coef"] * value_loss - entropy_coef * entropy_loss
-    loss.backward()
-    with torch.no_grad():
-        metrics = dict(policy_loss=policy_loss.item(), value_loss=value_loss.item(), entropy=entropy_loss.item(),
-                       old_approx_kl=(-logratio).mean().item(),
-                       approx_kl=((ratio - 1) - logratio).mean().item(),
-                       clipfrac=((ratio - 1).abs() > config["clip_coef"]).float().mean().item(),
-                       importance=ratio.mean().item())
-    return metrics, value.detach().float().reshape(shape), ratio.detach().reshape(shape)
+    new_values = torch.empty_like(old_values).flatten()
+    ratios = torch.empty_like(old_logprobs).flatten()
+    metrics = dict.fromkeys(("policy_loss", "value_loss", "entropy", "old_approx_kl",
+                            "approx_kl", "clipfrac", "importance"), 0.0)
+    length = prefixes.shape[1] + 1
+    chunk_size = max(1, config["max_minibatch_size"] // length)
+    for start in range(0, count, chunk_size):
+        stop = min(count, start + chunk_size)
+        positions = torch.arange(start, stop, device=storage_device)
+        windows = reconstruct_windows(observations, prefixes, resets,
+                                      rows[positions // horizon], positions % horizon).to(device)
+        part = slice(start, stop)
+        weight = (stop - start) / count
+        with amp_context:
+            logits, value = policy(windows, {})
+            _, logprob, entropy = sample_logits(logits, action=flat_actions[part])
+            logratio = logprob.reshape(-1) - old_logprobs.flatten()[part]
+            ratio = logratio.exp()
+            policy_loss = torch.maximum(-adv[part] * ratio, -adv[part] * ratio.clamp(
+                1 - config["clip_coef"], 1 + config["clip_coef"])).mean()
+            value = value.reshape(-1)
+            old_value = old_values.flatten()[part]
+            clipped = old_value + (value - old_value).clamp(-config["vf_clip_coef"], config["vf_clip_coef"])
+            target = returns.flatten()[part]
+            value_loss = 0.5 * torch.maximum((value - target).square(), (clipped - target).square()).mean()
+            entropy_loss = entropy.mean()
+            loss = (policy_loss + config["vf_coef"] * value_loss - entropy_coef * entropy_loss) * weight
+        loss.backward()
+        with torch.no_grad():
+            new_values[part] = value.float()
+            ratios[part] = ratio
+            chunk_metrics = dict(policy_loss=policy_loss, value_loss=value_loss, entropy=entropy_loss,
+                                 old_approx_kl=(-logratio).mean(),
+                                 approx_kl=((ratio - 1) - logratio).mean(),
+                                 clipfrac=((ratio - 1).abs() > config["clip_coef"]).float().mean(),
+                                 importance=ratio.mean())
+            for name, metric in chunk_metrics.items():
+                metrics[name] += metric.item() * weight
+        # Release the input before constructing the next chunk's windows.
+        del windows, logits, loss
+    return metrics, new_values.reshape(shape), ratios.reshape(shape)

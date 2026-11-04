@@ -302,7 +302,8 @@ class PuffeRL:
                     state["lstm_c"] = self.lstm_c[env_id.start]
 
                 logits, value = forward_with_history(
-                    self.policy, o_device, state, self.observation_history, done_mask, env_id)
+                    self.policy, o_device, state, self.observation_history, done_mask, env_id,
+                    config["max_minibatch_size"])
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
@@ -1183,7 +1184,8 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             with torch.no_grad():
                 ob = torch.as_tensor(ob).to(device)
                 logits, value = forward_with_history(
-                    policy, ob, state, history, sequence_done)
+                    policy, ob, state, history, sequence_done,
+                    max_minibatch_size=args["train"]["max_minibatch_size"])
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 

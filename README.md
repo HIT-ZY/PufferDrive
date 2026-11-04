@@ -155,12 +155,16 @@ History survives rollout-batch boundaries and optimizer updates. Use the same
 model selector and N when loading a weight-only checkpoint for evaluation.
 
 Training reconstructs each action's original window from observations and segment
-prefixes and processes the entire training minibatch with one forward/backward
-pass. Inference also processes the entire observation batch in one forward pass.
-There is no additional sequence chunking; the trainer's existing PPO minibatch
-and gradient accumulation settings still apply. Recomputing complete windows uses
-more activation memory and computation than stateful LSTM inference. The original
-`lstm` and both feedforward modes are unchanged.
+prefixes on demand, in chunks of at most
+`max(1, train.max_minibatch_size // N)` complete windows. Inference uses the same
+chunk limit. Each N-step sequence stays intact. Training normalizes advantages
+over the minibatch and weights each chunk's loss by its sample count before
+accumulating gradients; clipping and optimizer updates keep their original timing.
+With N=32 and the default maximum minibatch size of 32768, each chunk contains up
+to 1024 windows. Lowering `--train.max-minibatch-size` to 8192 reduces this to 256;
+the existing PPO minibatch/gradient accumulation rules still apply. Chunking bounds
+activation memory, but observation history and rollout buffers still occupy memory.
+The original `lstm` and both feedforward modes are unchanged.
 
 ## Visualizer
 
