@@ -44,6 +44,10 @@ def load_trainer(sequence):
 
 
 class SequenceTests(unittest.TestCase):
+    model_type = "lstm_seq"
+    wrapper_name = "RecurrentSequence"
+    temporal_weight_name = "lstm.weight_ih_l0"
+
     def setUp(self):
         self.old_threads = torch.get_num_threads()
         torch.set_num_threads(1)
@@ -55,14 +59,14 @@ class SequenceTests(unittest.TestCase):
     def config(self, selector, length=4, chunks=None):
         training = training_functions(selector)
         chunk_args = [] if chunks is None else ["--sequence-chunks", str(chunks)]
-        with patch.object(sys, "argv", ["puffer", "--model-type", "lstm_seq", "--sequence-length", str(length),
+        with patch.object(sys, "argv", ["puffer", "--model-type", self.model_type, "--sequence-length", str(length),
                                        "--train.device", "cpu", *chunk_args]):
             return training.load_config("puffer_drive")
 
-    def model(self, models, length=4, env=None):
+    def model(self, models, length=4, env=None, input_size=8, hidden_size=16):
         env = env or fake_env()
-        return models.RecurrentSequence(env, models.Drive(env, input_size=8, hidden_size=16),
-                                        input_size=16, hidden_size=16, sequence_length=length)
+        return models.RecurrentSequence(env, models.Drive(env, input_size=input_size, hidden_size=hidden_size),
+                                        input_size=hidden_size, hidden_size=hidden_size, sequence_length=length)
 
     def test_config_checkpoint_and_validation(self):
         with policy_modules() as (models, selector), tempfile.TemporaryDirectory() as directory:
@@ -71,11 +75,11 @@ class SequenceTests(unittest.TestCase):
             config = self.config(selector, 8)
             self.assertFalse(config["train"]["use_rnn"])
             self.assertTrue(config["train"]["use_sequence"])
-            self.assertEqual(config["rnn_name"], "RecurrentSequence")
+            self.assertEqual(config["rnn_name"], self.wrapper_name)
             self.assertEqual(config["train"]["sequence_length"], 8)
             self.assertEqual(config["train"]["sequence_chunks"], 0)
             self.assertEqual(config["train"]["rollout_horizon"], 32)
-            with patch.object(sys, "argv", ["puffer", "--model-type", "lstm_seq"]):
+            with patch.object(sys, "argv", ["puffer", "--model-type", self.model_type]):
                 self.assertEqual(training.load_config("puffer_drive")["sequence_length"], 32)
             for bad in (0, -1, 1.5, True):
                 with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "positive integer"):
@@ -121,11 +125,11 @@ class SequenceTests(unittest.TestCase):
             source = (ROOT / "pufferlib/config/ocean/drive.ini").read_text()
             ini.write_text(source.replace("sequence_chunks = 0", "sequence_chunks = 5"))
             for arguments, expected in (([], 5), (["--sequence-chunks", "0"], 0), (["--sequence-chunks", "3"], 3)):
-                with patch.object(sys, "argv", ["puffer", "--model-type", "lstm_seq", *arguments]):
+                with patch.object(sys, "argv", ["puffer", "--model-type", self.model_type, *arguments]):
                     cfg = training.load_config("puffer_drive", config_dir=str(root))
                 self.assertEqual(cfg["train"]["sequence_chunks"], expected)
             cfg = evaluation.load_settings(ini)
-            selector.apply_model_type(cfg, "lstm_seq")
+            selector.apply_model_type(cfg, self.model_type)
             self.assertEqual(cfg["train"]["sequence_chunks"], 5)
 
     def test_explicit_chunk_counts_are_balanced_and_independent_of_length(self):
@@ -315,7 +319,8 @@ class SequenceTests(unittest.TestCase):
                 self.assertTrue(all(call.args[0].shape == (2, 4, 1121)
                                     for call in forward.call_args_list))
                 self.assertEqual(step.call_count, 1)  # two logical minibatches, accumulated once
-                self.assertFalse(torch.equal(before["lstm.weight_ih_l0"], model.lstm.weight_ih_l0))
+                self.assertFalse(torch.equal(before[self.temporal_weight_name],
+                                             model.get_parameter(self.temporal_weight_name)))
                 torch.testing.assert_close(trainer.observation_history.buffer, previous, atol=0, rtol=0)
                 trainer.evaluate()
                 # Step 4 starts a new rollout batch, not a new episode. Agent 1 has not reset yet.
@@ -324,8 +329,10 @@ class SequenceTests(unittest.TestCase):
                 self.assertFalse(hasattr(trainer, "lstm_h"))
                 self.assertTrue(all(torch.isfinite(torch.tensor(v)) for v in trainer.losses.values()))
                 state = torch.load(next(Path(directory).rglob("trainer_state.pt")), weights_only=True)
-                self.assertEqual((state["model_type"], state["sequence_length"]), ("lstm_seq", 4))
+                self.assertEqual((state["model_type"], state["sequence_length"]), (self.model_type, 4))
                 self.assertEqual(state["sequence_chunks"], 2)
+                if self.model_type == "transformer":
+                    self.assertEqual(state["transformer"], config["transformer"])
 
     def test_all_inference_entrypoints_use_the_same_windows(self):
         with policy_modules() as (models, selector):
@@ -388,9 +395,7 @@ class SequenceTests(unittest.TestCase):
         with policy_modules() as (models, _):
             seq = importlib.import_module("pufferlib.sequence")
             env = fake_env()
-            model = models.RecurrentSequence(
-                env, models.Drive(env, input_size=64, hidden_size=256),
-                input_size=256, hidden_size=256, sequence_length=8).cuda()
+            model = self.model(models, length=8, env=env, input_size=64, hidden_size=256).cuda()
             obs = observations(64).reshape(8, 8, -1).cuda()
             prefixes = obs[:, :1].expand(-1, 7, -1).clone()
             resets = torch.zeros(8, 8, device="cuda", dtype=torch.bool)
@@ -401,7 +406,7 @@ class SequenceTests(unittest.TestCase):
             returns, advantages = torch.randn(8, 8, device="cuda"), torch.randn(8, 8, device="cuda")
             importance = torch.ones(8, 1, device="cuda")
             config = dict(clip_coef=.2, vf_clip_coef=.2, vf_coef=2., max_minibatch_size=64 * 8)
-            # Warm up both recurrent passes before comparing allocated memory.
+            # Warm up forward/backward before comparing allocated memory.
             model(obs[:1])[1].sum().backward()
             peaks = []
             for chunks in (1, 16):
@@ -503,7 +508,7 @@ class SequenceTests(unittest.TestCase):
                  contextlib.redirect_stdout(io.StringIO()):
                 utils.run_wosac_eval_in_subprocess(config["train"], SimpleNamespace(run_id="test"), 0, config)
             command = run.call_args.args[0]
-            for flag, value in (("--model-type", "lstm_seq"), ("--sequence-length", "8"),
+            for flag, value in (("--model-type", self.model_type), ("--sequence-length", "8"),
                                 ("--sequence-chunks", "5"),
                                 ("--policy.hidden-size", "16"), ("--train.device", "cpu"),
                                 ("--train.max-minibatch-size", str(config["train"]["max_minibatch_size"]))):

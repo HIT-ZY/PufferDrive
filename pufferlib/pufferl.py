@@ -35,7 +35,7 @@ import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
 import pufferlib.utils
-from pufferlib.model_config import apply_model_type
+from pufferlib.model_config import apply_model_type, wrapper_kwargs
 from pufferlib.sequence import ObservationHistory, make_history, forward_with_history, sequence_ppo_backward
 
 from pufferlib.ocean.benchmark.evaluator import Evaluator
@@ -611,6 +611,12 @@ class PuffeRL:
             **{f"losses/{k}": v for k, v in self.losses.items()},
             **{f"performance/{k}": v["elapsed"] for k, v in self.profile},
         }
+        if config.get("use_sequence", False):
+            logs.update(model_type=config.get("model_type") or "lstm_seq",
+                        sequence_length=config["sequence_length"],
+                        sequence_chunks=config.get("sequence_chunks", 0))
+            if config.get("model_type") == "transformer":
+                logs.update({f"transformer/{k}": v for k, v in config["transformer"].items()})
 
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
@@ -657,8 +663,10 @@ class PuffeRL:
             "run_id": run_id,
         }
         if self.config.get("use_sequence", False):
-            state.update(model_type="lstm_seq", sequence_length=self.config["sequence_length"],
+            state.update(model_type=self.config.get("model_type") or "lstm_seq", sequence_length=self.config["sequence_length"],
                          sequence_chunks=self.config.get("sequence_chunks", 0))
+            if self.config.get("model_type") == "transformer":
+                state["transformer"] = dict(self.config["transformer"])
         state_path = os.path.join(path, "trainer_state.pt")
         torch.save(state, state_path + ".tmp")
         os.rename(state_path + ".tmp", state_path)
@@ -702,8 +710,11 @@ class PuffeRL:
         s.add_column(f"{c1}Value", justify="right", vertical="top", width=14)
         s.add_row(f"{c2}Env", f"{b2}{config['env']}")
         if config.get("use_sequence", False):
-            s.add_row(f"{c2}Model", f"{b2}lstm_seq (N={config['sequence_length']})")
+            s.add_row(f"{c2}Model", f"{b2}{config.get('model_type') or 'lstm_seq'} (N={config['sequence_length']})")
             s.add_row(f"{c2}Seq chunks", f"{b2}{config.get('sequence_chunks', 0) or 'auto'}")
+            if config.get("model_type") == "transformer":
+                for name, value in config["transformer"].items():
+                    s.add_row(f"{c2}{name}", f"{b2}{value}")
         s.add_row(f"{c2}Params", abbreviate(self.model_size, b2, c2))
         s.add_row(f"{c2}Steps", abbreviate(agent_steps, b2, c2))
         s.add_row(f"{c2}SPS", abbreviate(sps, b2, c2))
@@ -1423,10 +1434,7 @@ def load_policy(args, vecenv, env_name=""):
     rnn_name = args["rnn_name"]
     if rnn_name is not None:
         rnn_cls = getattr(env_module.torch, args["rnn_name"])
-        rnn_kwargs = dict(args["rnn"])
-        if args["train"].get("use_sequence", False):
-            rnn_kwargs["sequence_length"] = args["sequence_length"]
-        policy = rnn_cls(vecenv.driver_env, policy, **rnn_kwargs)
+        policy = rnn_cls(vecenv.driver_env, policy, **wrapper_kwargs(args))
 
     policy = policy.to(device)
 
@@ -1467,8 +1475,8 @@ def load_config(env_name, config_dir=None):
     )
     parser.add_argument("--load-model-path", type=str, default=None, help="Path to a pretrained checkpoint")
     parser.add_argument(
-        "--model-type", choices=("mlp", "lstm", "lstm_seq"), default=None,
-        help="Drive architecture: MLP, stateful LSTM, or sliding-window LSTM; overrides policy-name/rnn-name",
+        "--model-type", choices=("mlp", "lstm", "lstm_seq", "transformer"), default=None,
+        help="Drive architecture: MLP, stateful LSTM, window LSTM or Transformer; overrides policy-name/rnn-name",
     )
     parser.add_argument(
         "--load-id", type=str, default=None, help="Kickstart/eval from from a finished Wandb/Neptune run"

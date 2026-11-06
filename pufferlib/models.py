@@ -229,6 +229,84 @@ class LSTMSequenceWrapper(LSTMWrapper):
         return self.forward(observations, state)
 
 
+class TransformerSequenceWrapper(nn.Module):
+    """Bidirectional attention over a past-observation window, without cached state."""
+
+    def __init__(self, env, policy, sequence_length=32, num_layers=1, num_heads=4, dim_feedforward=512):
+        super().__init__()
+        from pufferlib.model_config import transformer_settings
+
+        if isinstance(sequence_length, bool) or not isinstance(sequence_length, int) or sequence_length < 1:
+            raise ValueError("sequence_length must be a positive integer")
+        settings = transformer_settings(policy.hidden_size, dict(
+            num_layers=num_layers, num_heads=num_heads, dim_feedforward=dim_feedforward))
+        self.policy = policy
+        self.hidden_size = policy.hidden_size
+        self.obs_shape = env.single_observation_space.shape
+        self.is_continuous = policy.is_continuous
+        self.sequence_length = sequence_length
+
+        # Match LSTMWrapper's shared-policy initialization, before creating the
+        # temporal module, including the RNG order for identical shared weights.
+        for name, param in self.named_parameters():
+            if "layer_norm" in name:
+                continue
+            if "bias" in name:
+                nn.init.constant_(param, 0)
+            elif "weight" in name and param.ndim >= 2:
+                nn.init.orthogonal_(param, 1.0)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_size, nhead=settings["num_heads"],
+            dim_feedforward=settings["dim_feedforward"], dropout=0., activation="gelu",
+            batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(
+            layer, num_layers=settings["num_layers"], norm=nn.LayerNorm(self.hidden_size),
+            enable_nested_tensor=False)
+        # TransformerEncoder clones its prototype; initialize each clone
+        # independently instead of starting every layer with identical weights.
+        for block in self.transformer.layers:
+            nn.init.xavier_uniform_(block.self_attn.in_proj_weight)
+            nn.init.zeros_(block.self_attn.in_proj_bias)
+            for linear in (block.self_attn.out_proj, block.linear1, block.linear2):
+                nn.init.xavier_uniform_(linear.weight)
+                nn.init.zeros_(linear.bias)
+            block.norm1.reset_parameters()
+            block.norm2.reset_parameters()
+        self.transformer.norm.reset_parameters()
+
+        positions = torch.arange(sequence_length, dtype=torch.float32)[:, None]
+        frequencies = torch.exp(torch.arange(0, self.hidden_size, 2, dtype=torch.float32)
+                                * (-np.log(10000.0) / self.hidden_size))
+        angles = positions * frequencies
+        encoding = torch.empty(sequence_length, self.hidden_size)
+        encoding[:, 0::2] = angles.sin()
+        encoding[:, 1::2] = angles[:, :self.hidden_size // 2].cos()
+        # Deterministic context, not learned weights or a cross-call cache.
+        self.register_buffer("position_encoding", encoding.unsqueeze(0), persistent=False)
+
+    def forward(self, observations, state=None):
+        if (observations.ndim != len(self.obs_shape) + 2
+                or observations.shape[1] != self.sequence_length
+                or tuple(observations.shape[2:]) != tuple(self.obs_shape)):
+            raise ValueError("Expected observations shaped [B, sequence_length, *obs_shape]")
+        if state is not None and any(key in state for key in ("lstm_h", "lstm_c", "past_key_values", "kv_cache")):
+            raise ValueError("transformer does not accept a recurrent hidden state or KV cache")
+        batch, length = observations.shape[:2]
+        encoded = self.policy.encode_observations(
+            observations.reshape(batch * length, *self.obs_shape), state=state)
+        encoded = encoded.reshape(batch, length, self.hidden_size)
+        encoded = encoded + self.position_encoding.to(dtype=encoded.dtype)
+        # Every token is valid, including repeated first frames. The entire
+        # window ends at the current observation, so bidirectional attention
+        # within it never exposes future environment observations.
+        output = self.transformer(encoded)
+        return self.policy.decode_actions(torch.tanh(output[:, -1].float()))
+
+    def forward_eval(self, observations, state=None):
+        return self.forward(observations, state)
+
+
 class Convolutional(nn.Module):
     def __init__(
         self,

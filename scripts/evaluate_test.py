@@ -98,12 +98,16 @@ def parse_args(argv=None):
     parser.add_argument("--config", type=Path, default=ROOT / "pufferlib/config/ocean/drive.ini",
                         help="Training INI (architecture and driving reward/goal settings)")
     model_group = parser.add_mutually_exclusive_group()
-    model_group.add_argument("--model-type", choices=("mlp", "lstm", "lstm_seq"), default=None,
-                            help="Drive architecture: MLP, stateful LSTM, or sliding-window LSTM")
+    model_group.add_argument("--model-type", choices=("mlp", "lstm", "lstm_seq", "transformer"), default=None,
+                            help="Drive architecture: MLP, stateful LSTM, window LSTM or Transformer")
     parser.add_argument("--sequence-length", type=positive_int, default=None,
-                        help="lstm_seq observation window; must match training (INI default: 32)")
+                        help="Sequence observation window; must match training (INI default: 32)")
     parser.add_argument("--sequence-chunks", type=nonnegative_int, default=None,
-                        help="lstm_seq chunks per inference batch: 0=automatic, 1=one batch; may differ from training")
+                        help="Sequence chunks per inference batch: 0=automatic, 1=one batch; may differ from training")
+    for name in ("num_layers", "num_heads", "dim_feedforward"):
+        parser.add_argument(f"--transformer.{name.replace('_', '-')}",
+                            dest=f"transformer_{name}", type=positive_int, default=None,
+                            help="Transformer architecture override; must match training (defaults from INI)")
     model_group.add_argument("--rnn-name", choices=("None", "Recurrent"), default=None,
                         help="Override the INI's rnn_name: None disables recurrence, Recurrent enables LSTM")
     options = parser.parse_args(argv)
@@ -341,15 +345,12 @@ def check_metrics(row, keys, allow_none=()):
 def load_policy(config, env, checkpoint, device):
     import torch
     from pufferlib.ocean import torch as policy_module
-    from pufferlib.model_config import apply_model_type
+    from pufferlib.model_config import apply_model_type, wrapper_kwargs
 
     apply_model_type(config)
     policy = getattr(policy_module, config["policy_name"])(env, **config["policy"])
     if config["rnn_name"] is not None:
-        rnn_kwargs = dict(config["rnn"])
-        if config["train"].get("use_sequence", False):
-            rnn_kwargs["sequence_length"] = config["sequence_length"]
-        policy = getattr(policy_module, config["rnn_name"])(env, policy, **rnn_kwargs)
+        policy = getattr(policy_module, config["rnn_name"])(env, policy, **wrapper_kwargs(config))
     weights = torch.load(checkpoint, map_location=device, weights_only=True)
     weights = {key.removeprefix("module."): value for key, value in weights.items()}
     policy.load_state_dict(weights, strict=True)
@@ -539,6 +540,15 @@ def evaluate(options, config, report):
                        if config["train"].get("use_sequence") else
                        "zero at rollout start only; no history warm-up or per-agent reset on respawn"),
     }
+    if config["train"].get("use_sequence"):
+        report["settings"]["state_handling"] = (
+            "Recompute each past-observation window; no cross-call recurrent state or KV cache. "
+            "Repeat first frame on the left; reset each agent's history on done/truncated "
+            "and all histories on environment reset or map change.")
+    if config.get("model_type") == "transformer":
+        report["settings"]["transformer"] = dict(config["train"]["transformer"])
+        report["settings"]["attention"] = "bidirectional within the past/current window; no padding mask"
+        report["settings"]["lstm_reset"] = None
     for mode in STAGES:
         status = report["stages"][mode]
         if mode not in options.stages:
@@ -704,8 +714,12 @@ def main(argv=None):
             config["sequence_length"] = options.sequence_length
         if options.sequence_chunks is not None:
             config["sequence_chunks"] = options.sequence_chunks
+        for name in ("num_layers", "num_heads", "dim_feedforward"):
+            value = getattr(options, f"transformer_{name}")
+            if value is not None:
+                config.setdefault("transformer", {})[name] = value
         if (options.model_type is not None or config.get("model_type") is not None
-                or config["rnn_name"] == "RecurrentSequence"):
+                or config["rnn_name"] in ("RecurrentSequence", "TransformerSequence")):
             from pufferlib.model_config import apply_model_type
             apply_model_type(config, options.model_type)
         if options.rnn_name is not None:

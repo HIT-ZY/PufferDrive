@@ -64,7 +64,7 @@ def training_functions(selector):
                  and node.name in ("load_config", "load_policy")]
     namespace = dict(globals(), __file__=str(path), pufferlib=sys.modules["pufferlib"],
                      RichHelpFormatter=argparse.HelpFormatter,
-                     apply_model_type=selector.apply_model_type)
+                     apply_model_type=selector.apply_model_type, wrapper_kwargs=selector.wrapper_kwargs)
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
     return SimpleNamespace(**namespace)
 
@@ -296,17 +296,20 @@ class DriveModelTests(unittest.TestCase):
             root = Path(directory)
             checkpoint = root / "model.pt"
             checkpoint.touch()
-            for kind in ("mlp", "lstm", "lstm_seq"):
+            for kind in ("mlp", "lstm", "lstm_seq", "transformer"):
                 seen = []
 
                 def run_stage(options, config, ids, report, mode, *args):
                     seen.append(mode)
                     self.assertEqual(config["policy_name"], "DriveMLP" if kind == "mlp" else "Drive")
                     self.assertEqual(config["train"]["use_rnn"], kind == "lstm")
-                    if kind == "lstm_seq":
+                    if kind in ("lstm_seq", "transformer"):
                         self.assertTrue(config["train"]["use_sequence"])
                         self.assertEqual(config["train"]["sequence_length"], 4)
                         self.assertEqual(config["train"]["sequence_chunks"], 3)
+                    if kind == "transformer":
+                        self.assertEqual(config["transformer"],
+                                         dict(num_layers=2, num_heads=8, dim_feedforward=96))
                     row = {"scenario_id": ids[0], "rollout": 0}
                     if mode == "wosac":
                         row.update({key: 0.5 for key in evaluation.WOSAC_METRICS})
@@ -327,6 +330,8 @@ class DriveModelTests(unittest.TestCase):
                         "--checkpoint", str(checkpoint), "--model-type", kind,
                         "--sequence-length", "4",
                         "--sequence-chunks", "3",
+                        *(["--transformer.num-layers", "2", "--transformer.num-heads", "8",
+                           "--transformer.dim-feedforward", "96"] if kind == "transformer" else []),
                         "--output-dir", str(root / kind), "--num-maps", "1",
                         "--sanity-rollouts", "1", "--sanity-maps", evaluation.SANITY_MAPS[0],
                     ])
@@ -335,10 +340,16 @@ class DriveModelTests(unittest.TestCase):
                 report = json.loads(next((root / kind).glob("*.json")).read_text())
                 self.assertEqual(report["settings"]["model_type"], kind)
                 self.assertEqual(report["settings"]["rnn_name"],
-                                 {"lstm": "Recurrent", "lstm_seq": "RecurrentSequence", "mlp": None}[kind])
-                if kind == "lstm_seq":
+                                 {"lstm": "Recurrent", "lstm_seq": "RecurrentSequence",
+                                  "transformer": "TransformerSequence", "mlp": None}[kind])
+                if kind in ("lstm_seq", "transformer"):
                     self.assertEqual(report["settings"]["sequence_length"], 4)
                     self.assertEqual(report["settings"]["sequence_chunks"], 3)
+                if kind == "transformer":
+                    self.assertEqual(report["settings"]["transformer"],
+                                     dict(num_layers=2, num_heads=8, dim_feedforward=96, hidden_size=256))
+                    self.assertIn("no cross-call recurrent state or KV cache", report["settings"]["state_handling"])
+                    self.assertIsNone(report["settings"]["lstm_reset"])
 
     def test_evaluation_rejects_conflicting_selectors(self):
         evaluation = evaluation_module()

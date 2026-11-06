@@ -55,7 +55,7 @@ def run_wosac_eval_in_subprocess(config, logger, global_step, full_args=None):
         ]
 
         if config.get("use_sequence", False):
-            cmd.extend(["--model-type", "lstm_seq", "--sequence-length", str(config["sequence_length"]),
+            cmd.extend(["--model-type", config.get("model_type") or "lstm_seq", "--sequence-length", str(config["sequence_length"]),
                         "--sequence-chunks", str(config.get("sequence_chunks", 0)),
                         "--train.device", str(config["device"]),
                         "--train.max-minibatch-size", str(config["max_minibatch_size"])])
@@ -63,6 +63,12 @@ def run_wosac_eval_in_subprocess(config, logger, global_step, full_args=None):
             for section in ("policy", "rnn"):
                 for key, value in (full_args or {}).get(section, {}).items():
                     cmd.extend([f"--{section}.{key.replace('_', '-')}", str(value)])
+            if config.get("model_type") == "transformer":
+                settings = (full_args or {}).get("transformer", config["transformer"])
+                for key in ("num_layers", "num_heads", "dim_feedforward"):
+                    cmd.extend([f"--transformer.{key.replace('_', '-')}", str(settings[key])])
+                if "hidden_size" not in (full_args or {}).get("policy", {}):
+                    cmd.extend(["--policy.hidden-size", str(config["transformer"]["hidden_size"])])
             for key in ("action_type", "dynamics_model"):
                 if key in (full_args or {}).get("env", {}):
                     cmd.extend([f"--env.{key.replace('_', '-')}", str(full_args["env"][key])])

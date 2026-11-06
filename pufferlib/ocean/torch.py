@@ -11,6 +11,7 @@ from pufferlib.models import Convolutional as Conv  # noqa: F401
 
 Recurrent = pufferlib.models.LSTMWrapper
 RecurrentSequence = pufferlib.models.LSTMSequenceWrapper
+TransformerSequence = pufferlib.models.TransformerSequenceWrapper
 
 
 class Drive(nn.Module):

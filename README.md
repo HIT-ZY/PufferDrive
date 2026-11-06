@@ -180,6 +180,51 @@ intact, and clipping/optimizer updates keep their original timing. More chunks
 reduce activation memory per call, while observation history and rollout buffers
 still occupy memory. The original `lstm` and both feedforward modes are unchanged.
 
+### Fixed-window Transformer
+
+`transformer` uses the same observation windows and PPO chunking as `lstm_seq`:
+
+```bash
+puffer train puffer_drive --model-type transformer --sequence-length 32 --sequence-chunks 4
+python scripts/evaluate_test.py --checkpoint /path/to/model.pt --model-type transformer --sequence-length 32 --sequence-chunks 4
+puffer eval puffer_drive --load-model-path /path/to/model.pt --model-type transformer --sequence-length 32 --sequence-chunks 4
+```
+
+The model applies the shared Drive encoder to each frame, adds fixed sinusoidal
+positions 0…N−1, and runs a bidirectional Transformer encoder with Pre-LayerNorm,
+GELU and zero dropout. A final LayerNorm and Tanh on the last frame feed the shared
+actor/value heads. Only these head-input features are bounded to [-1, 1]; logits
+and value predictions are not bounded. Attention covers only the current and
+past observations in the window. Repeated first frames are valid context, with
+no causal or padding mask. Every call recomputes the full window; there is no
+recurrent hidden state or KV cache between calls.
+
+The `[transformer]` INI section and the following CLI flags are shared by training
+and evaluation:
+
+| Flag | Default |
+| --- | --- |
+| `--transformer.num-layers` | 1 |
+| `--transformer.num-heads` | 4 |
+| `--transformer.dim-feedforward` | 512 |
+
+Width comes from `[policy] hidden_size` (default 256) and must be divisible by the
+head count. All dimensions must be positive integers. For a different width, use
+`--policy.hidden-size` when training or using `puffer eval`, and a matching
+`--config` INI with `scripts/evaluate_test.py`. Defaults give 615,516 parameters
+for discrete actions, compared with LSTM's 614,236 (about 0.21% more). The shared
+encoder and heads use the LSTM initialization; attention/feedforward matrices
+use independent Xavier uniform initialization in every layer.
+
+Use the same model type, N, policy dimensions and Transformer structure when
+loading weights. `sequence-chunks` may differ between training and evaluation:
+0 selects automatic chunking, 1 processes the whole batch, and positive K splits
+it into K balanced chunks. All self-play, human replay and WOSAC entrypoints use
+these settings. Logs, `trainer_state.pt` and evaluation reports record the model,
+window/chunk settings and Transformer dimensions; model `.pt` files remain plain
+state dictionaries. Full-window recomputation increases work, and attention
+memory grows with N; this model does not guarantee better results or speed.
+
 ## Visualizer
 
 <details>
